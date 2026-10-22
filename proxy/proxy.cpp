@@ -5,13 +5,21 @@
 // controller's pose before the game sees it. Gaze comes from Steam Link's OSC stream
 // (/tracking/eye/CenterVecFull on 127.0.0.1:9000), read on a thread in this DLL.
 //
+// How REZ.exe aims (docs/aim-re.md): it reads poses only from WaitGetPoses, and aims along the
+// selected hand controller's -Z. With "VR control type" = "motion controller only" the cursor
+// angle is the controller's direction relative to the head, so a controller rotation of
+// R_head * R_gaze puts the cursor where the eyes look. If the tracking system is "oculus"
+// (SteamVR may simulate a Rift for this legacy app), the game tilts the aim by -39.4 deg about
+// the controller's X, which tilt=auto undoes.
+//
 // rez_gaze.ini beside the DLL, reread every second:
 //   [rez_gaze]
-//   mode=log|head|gaze     log: record calls only; head: controller points where the head
-//                          points; gaze: controller points from the hand at the gazed point
+//   mode=log|head|gaze     log: record calls only; head: controllers point where the head
+//                          points; gaze: controllers point where the eyes look
 //   hand=right|left|both   which controller(s) to rewrite
-//   distance=30            metres to the gazed point (gaze mode)
-//   pitch=0, yaw=0         degrees, rotate the result in the controller's own frame
+//   tilt=auto              degrees about the controller's X added to undo the game's offset;
+//                          auto = 39.4 when the tracking system is "oculus", else 0
+//   pitch=0, yaw=0         further degrees in the controller's own frame (tuning)
 //   smooth_ms=0            exponential smoothing of the gaze direction
 //   port=9000              OSC port (read at start only)
 // Log: rez_gaze.log beside the DLL.
@@ -57,7 +65,8 @@ enum class Mode { Log, Head, Gaze };
 struct Config {
     Mode mode = Mode::Log;
     bool right = true, left = true;
-    double distance = 30, pitch = 0, yaw = 0, smooth_ms = 0;
+    bool tilt_auto = true;
+    double tilt = 0, pitch = 0, yaw = 0, smooth_ms = 0;
     int port = 9000;
 };
 
@@ -78,7 +87,9 @@ Config ReadConfig() {
         GetPrivateProfileStringW(L"rez_gaze", key, L"", b, 64, ini.c_str());
         return b[0] ? _wtof(b) : def;
     };
-    c.distance = num(L"distance", 30);
+    GetPrivateProfileStringW(L"rez_gaze", L"tilt", L"auto", buf, 64, ini.c_str());
+    c.tilt_auto = _wcsicmp(buf, L"auto") == 0;
+    c.tilt = c.tilt_auto ? 0 : _wtof(buf);
     c.pitch = num(L"pitch", 0);
     c.yaw = num(L"yaw", 0);
     c.smooth_ms = num(L"smooth_ms", 0);
@@ -180,6 +191,64 @@ vr::TrackedDeviceIndex_t g_left = vr::k_unTrackedDeviceIndexInvalid;
 V3 g_smoothed{0, 0, -1};
 LONGLONG g_smoothed_qpc = 0;
 
+// ---- game state, read-only (addresses from docs/aim-re.md, REZ.exe 2.8 only) --------------
+
+std::atomic<bool> g_is_oculus{false};  // TrackingSystemName of the HMD == "oculus"
+
+constexpr DWORD kRezTimeDateStamp = 0x658122f1;
+uintptr_t g_rez_base = 0;  // 0 when the exe isn't the analysed build
+
+void FindRez() {
+    auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
+    auto* nt = reinterpret_cast<IMAGE_NT_HEADERS64*>(base + dos->e_lfanew);
+    if (nt->FileHeader.TimeDateStamp == kRezTimeDateStamp) g_rez_base = base;
+    Log("exe TimeDateStamp 0x%08lx: %s", nt->FileHeader.TimeDateStamp,
+        g_rez_base ? "REZ.exe 2.8, state logging on" : "not the analysed build, state logging off");
+}
+
+struct RezState {
+    int control_type = -1;  // byte 0x14052265c: 0 head+controller, 1 controller only, 2 head only
+    int input_device = -1;  // DAT_1404cc8a8: 3 = VR controller
+    int selected = -1;      // manager +0xa08: 0 left, 1 right
+    int is_oculus = -1;     // manager +0xc58
+    float drift = 0;        // manager +0xc70: type-1 yaw offset (rad)
+};
+
+bool ReadRezState(RezState& s) {
+    if (!g_rez_base) return false;
+    __try {
+        s.control_type = *reinterpret_cast<unsigned char*>(g_rez_base + 0x52265c);
+        s.input_device = *reinterpret_cast<int*>(g_rez_base + 0x4cc8a8);
+        auto mgr = *reinterpret_cast<uintptr_t*>(g_rez_base + 0xa1e360);
+        if (mgr) {
+            s.selected = *reinterpret_cast<int*>(mgr + 0xa08);
+            s.is_oculus = *reinterpret_cast<unsigned char*>(mgr + 0xc58);
+            s.drift = *reinterpret_cast<float*>(mgr + 0xc70);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Unpatched IVRSystem_015 slots, called through the game's own object.
+using FnClass = vr::ETrackedDeviceClass(__fastcall*)(void*, vr::TrackedDeviceIndex_t);
+using FnStrProp = uint32_t(__fastcall*)(void*, vr::TrackedDeviceIndex_t, vr::ETrackedDeviceProperty, char*, uint32_t,
+                                        vr::ETrackedPropertyError*);
+
+std::string DeviceString(vr::TrackedDeviceIndex_t i, vr::ETrackedDeviceProperty p) {
+    char buf[128] = {};
+    vr::ETrackedPropertyError e;
+    reinterpret_cast<FnStrProp>((*reinterpret_cast<void***>(g_system))[26])(g_system, i, p, buf, sizeof buf, &e);
+    return buf;
+}
+
+int DeviceClass(vr::TrackedDeviceIndex_t i) {
+    if (i == vr::k_unTrackedDeviceIndexInvalid) return -1;
+    return reinterpret_cast<FnClass>((*reinterpret_cast<void***>(g_system))[19])(g_system, i);
+}
+
 void RefreshEverySecond() {
     static LONGLONG last = 0;
     LONGLONG now = Qpc();
@@ -192,9 +261,23 @@ void RefreshEverySecond() {
         g_cfg = c;
     }
     if (g_system && g_orig_role_to_index) {
+        static bool system_logged = false;
+        if (!system_logged) {
+            std::string ts = DeviceString(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_TrackingSystemName_String);
+            g_is_oculus = ts == "oculus";
+            Log("HMD tracking system \"%s\", model \"%s\"%s", ts.c_str(),
+                DeviceString(vr::k_unTrackedDeviceIndex_Hmd, vr::Prop_ModelNumber_String).c_str(),
+                g_is_oculus ? ": the game tilts aim -39.4 deg, tilt=auto undoes it" : "");
+            system_logged = true;
+        }
         auto r = g_orig_role_to_index(g_system, vr::TrackedControllerRole_RightHand);
         auto l = g_orig_role_to_index(g_system, vr::TrackedControllerRole_LeftHand);
-        if (r != g_right || l != g_left) Log("hands: right=%d left=%d", (int)r, (int)l);
+        if (r != g_right || l != g_left) {
+            Log("hands: right=%d (class %d, \"%s\") left=%d (class %d, \"%s\")", (int)r, DeviceClass(r),
+                r == vr::k_unTrackedDeviceIndexInvalid ? "" : DeviceString(r, vr::Prop_TrackingSystemName_String).c_str(),
+                (int)l, DeviceClass(l),
+                l == vr::k_unTrackedDeviceIndexInvalid ? "" : DeviceString(l, vr::Prop_TrackingSystemName_String).c_str());
+        }
         g_right = r;
         g_left = l;
     }
@@ -230,12 +313,14 @@ V3 WorldGaze(const vr::HmdMatrix34_t& head, const Config& c) {
     return w;
 }
 
-// Rotation whose -Z points along f, roll taken from the head's up, then pitch/yaw in its frame.
+// Rotation whose -Z points along f, roll taken from the head's up, then yaw and pitch (tilt +
+// pitch) in its own frame.
 void Aim(vr::HmdMatrix34_t& m, V3 f, V3 up, const Config& c) {
     V3 z = f * -1;
     V3 x = Norm(Cross(up, z));
     V3 y = Cross(z, x);
-    double p = c.pitch * 3.14159265358979 / 180, w = c.yaw * 3.14159265358979 / 180;
+    double tilt = c.tilt_auto ? (g_is_oculus ? 39.4 : 0.0) : c.tilt;
+    double p = (tilt + c.pitch) * 3.14159265358979 / 180, w = c.yaw * 3.14159265358979 / 180;
     // yaw about local y, then pitch about local x
     V3 x1 = x * std::cos(w) - z * std::sin(w), z1 = x * std::sin(w) + z * std::cos(w);
     V3 y2 = y * std::cos(p) + z1 * std::sin(p), z2 = z1 * std::cos(p) - y * std::sin(p);
@@ -255,14 +340,13 @@ void Rewrite(vr::TrackedDevicePose_t* poses, uint32_t n) {
     }
     if (c.mode == Mode::Log || !poses[0].bPoseIsValid) return;
     const vr::HmdMatrix34_t& head = poses[0].mDeviceToAbsoluteTracking;
-    V3 head_pos = Pos(head);
+    // The game projects the controller ray 400 m out, so the hand's offset from the head
+    // doesn't matter: aim along the world gaze direction from wherever the hand is.
     V3 dir = c.mode == Mode::Gaze ? WorldGaze(head, c) : Norm(Col(head, 2) * -1);
     for (vr::TrackedDeviceIndex_t i : {c.right ? g_right : vr::k_unTrackedDeviceIndexInvalid,
                                        c.left ? g_left : vr::k_unTrackedDeviceIndexInvalid}) {
         if (i == vr::k_unTrackedDeviceIndexInvalid || i >= n || !poses[i].bPoseIsValid) continue;
-        vr::HmdMatrix34_t& m = poses[i].mDeviceToAbsoluteTracking;
-        V3 f = c.mode == Mode::Gaze ? Norm(head_pos + dir * c.distance - Pos(m)) : dir;
-        Aim(m, f, Col(head, 1), c);
+        Aim(poses[i].mDeviceToAbsoluteTracking, dir, Col(head, 1), c);
         ++g_rewrites;
     }
 }
@@ -301,6 +385,16 @@ void ReportEveryFiveSeconds() {
     Log("5 s:%s | rewrites=%ld | osc packets=%ld, last %.0f ms ago, gaze %.3f %.3f %.3f", s.c_str(),
         g_rewrites.exchange(0), g_gaze_packets.exchange(0), at ? (now - at) * 1000.0 / g_qpf : -1.0, g.x,
         g.y, g.z);
+    RezState st;
+    if (ReadRezState(st)) {
+        static const char* kTypes[] = {"head+controller (drifts past 30 deg; use controller only)",
+                                       "controller only", "head only (gaze can't aim)"};
+        Log("     game: control type %d %s | input device %d%s | selected %s | isOculus %d | drift %.1f deg",
+            st.control_type, st.control_type >= 0 && st.control_type <= 2 ? kTypes[st.control_type] : "?",
+            st.input_device, st.input_device == 3 ? " (VR controller)" : " (not VR: press a controller button)",
+            st.selected == 0 ? "left" : st.selected == 1 ? "right" : "?", st.is_oculus,
+            st.drift * 57.29577951308232);
+    }
 }
 
 void Tick() {
@@ -397,9 +491,10 @@ void Init(HMODULE self) {
     QueryPerformanceFrequency(&f);
     g_qpf = f.QuadPart;
     g_cfg = ReadConfig();
-    Log("rez_gaze spike loaded; mode %s, hands %s%s, distance %.1f, pitch %.1f, yaw %.1f, smooth %.0f ms",
-        ModeName(g_cfg.mode), g_cfg.right ? "R" : "", g_cfg.left ? "L" : "", g_cfg.distance, g_cfg.pitch,
-        g_cfg.yaw, g_cfg.smooth_ms);
+    Log("rez_gaze spike loaded; mode %s, hands %s%s, tilt %s, pitch %.1f, yaw %.1f, smooth %.0f ms",
+        ModeName(g_cfg.mode), g_cfg.right ? "R" : "", g_cfg.left ? "L" : "",
+        g_cfg.tilt_auto ? "auto" : std::to_string(g_cfg.tilt).c_str(), g_cfg.pitch, g_cfg.yaw, g_cfg.smooth_ms);
+    FindRez();
     HMODULE real = LoadLibraryW((g_dir + L"openvr_api_real.dll").c_str());
     if (!real) {
         Log("can't load openvr_api_real.dll (error %lu)", GetLastError());
