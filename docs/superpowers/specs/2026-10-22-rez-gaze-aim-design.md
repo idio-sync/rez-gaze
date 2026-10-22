@@ -203,10 +203,12 @@ Details **(my call)**:
 - Targets: `REZ.exe` and the frame-rate session's `REZ_120.exe`. They have the same PE
   TimeDateStamp and the same layout, so the state logging works for both. Only the tick rate
   differs, and nothing in this design depends on it.
-- Ownership of `openvr_api.dll` long term is being agreed with the frame-rate session, whose
-  notes see it as a way in for VR interpolation. If it needs OpenVR hooks too, v1 adds a small
-  exported callback registry (pre/post `WaitGetPoses` and `Submit`) rather than two mods
-  patching the same objects blindly.
+- **`openvr_api.dll` belongs to this mod.** The frame-rate session confirmed on 2026-10-22 that
+  rez_hfr doesn't hook OpenVR and has no plan to.
+  - In VR, rez_hfr adds camera-setup calls per drawn frame, which read the VR manager's
+    head-pose getters, but no extra `WaitGetPoses` or `Submit`.
+  - If it ever needs display timing, it will ask for an exported callback registry rather
+    than patch this DLL's vtable slots. Not in v1.
 
 ### Coexisting with rez_hfr
 
