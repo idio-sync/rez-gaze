@@ -83,6 +83,34 @@ beside Rez won't be focused. Hence the probe's `inproc` mode.
   focus problem and the legacy-input problem: a helper (or the proxy DLL itself) just listens.
   `gaze_probe osc` listens on 9000.
 
+## Probe run 3 (2026-10-22, after turning on both Steam Link settings): gaze works
+
+With `shareEyeTrackingData`, `useOSC` (and `useOSCFace`) on, written to `steamvr.vrsettings`
+under `driver_vrlink`, and vrlink logging "OSC was (re)initialized successfully. In Port: 9016,
+Out Port: 9000":
+
+| Run | Beside | Tracked | New directions | Off head-forward (median / p90 / max) |
+|---|---|---|---|---|
+| `openxr --frames`, 30 s | nothing (it is the scene app) | 100% once FOCUSED (4.5 s in) | 122/s (one per 144 Hz frame) | 21.5 / 25.8 / 34.7° |
+| `openvr` overlay, 15 s | SteamVR Home | 100% from 0.3 s | 200/s (every poll; predicted) | 15.2 / 21.7 / 36.9° |
+| `osc`, 20 s | SteamVR Home | all valid | 57–72/s | 11.1 / 17.8 / 17.9° |
+| `openvr` overlay, 30 s | **Rez (REZ.exe, scene app, vr=1)** | **100%** from 0.2 s | 186/s | 14.2 / 24.7 / 35.5° |
+| `osc`, 30 s (same time) | **Rez** | all valid | 57/s | 15.5 / 24.2 / 30.8° |
+
+- **Feasibility answered: a separate helper gets the gaze while Rez runs**, both through OpenVR
+  as an overlay app (binding `/user/head/eyetracking` on `frame_hmd` is right) and over OSC.
+  Neither needs focus, and neither touches Rez's process or its legacy input.
+- OSC sends: `/tracking/eye/CenterVecFull ,fff` (unnormalised, length ~1.08, +Z forward),
+  `/sl/eyeTrackedGazePoint ,fff` (the same with -Z forward), `/tracking/eye/EyesClosedAmount ,f`,
+  `/sl/xrfb/facew/EyesClosedL|R ,f`, and VRChat's `/avatar/parameters/{Left,Right}Eye{X,Y,Lid,...}`.
+  The probe's "tracked" for OSC uses EyesClosedAmount < 0.5, which is wrong: the values don't
+  read as plain 0 open / 1 closed (LeftEyeLid 1.0 with EyesClosedL 1.0 and the right eye 0.27
+  in one packet). Blink handling needs its own look before the mod relies on it.
+- OpenXR's tracked flag stays set through blinks (as Vitrine3D found on the device); OpenVR's
+  probably too. OSC is the only source with lid data.
+- Not yet measured: latency of each route (gaze change → value), and accuracy against known
+  targets.
+
 ## Planned mod (unchanged by the probe's outcome, except where gaze comes from)
 
 - A proxy `openvr_api.dll`, one copy in each program's DLL folder (above), forwarding every
@@ -91,9 +119,9 @@ beside Rez won't be focused. Hence the probe's `inproc` mode.
   rewrites `WaitGetPoses` / `GetDeviceToAbsoluteTrackingPose` results: the aiming controller's
   orientation becomes the head pose turned by the gaze direction. Buttons stay on the real
   controller. Gaze is applied head-relative, so OpenXR and OpenVR spaces never need lining up.
-- Because both programs use legacy input, gaze read inside the game via `IVRInput` may switch
-  their controller input off (SteamVR treats an app that sets an action manifest as an action
-  app). The probe's `--legacy-check` tests exactly that.
+- Gaze comes from outside the game (run 3): an OpenVR overlay helper or OSC, handed to the
+  proxy DLL (shared memory for the helper; or the DLL listens to OSC itself on a thread). Rez's
+  process never sets an action manifest, so its legacy input is untouched.
 - Feel: hold through dropouts, light smoothing of fixation jitter, maybe snap to the nearest
   enemy within ~2°.
 - Under Proton/FEX on the headset, Wine loads the game-folder DLL the same way.
