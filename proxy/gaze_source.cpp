@@ -57,6 +57,9 @@ bool HelperSource::Start(const std::wstring& helper_exe, DWORD game_pid, LogFn l
     std::call_once(once_, [&] {
         game_pid_ = game_pid;
         reader_ = new Reader;
+        // Create the block first: it then outlives a helper that fails and exits, so its status
+        // still reaches the log.
+        if (!reader_->shm.Create(ShmName(game_pid))) log("helper: can't create shared memory (error %lu)", GetLastError());
         std::wstring cmd = L"\"" + helper_exe + L"\" --parent " + std::to_wstring(game_pid);
         STARTUPINFOW si{sizeof si};
         PROCESS_INFORMATION pi{};

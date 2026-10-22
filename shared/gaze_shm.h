@@ -83,10 +83,23 @@ private:
 
 class GazeShmReader {
 public:
+    // Creates the block (or opens it if it exists) and keeps it alive for as long as this
+    // reader lives, so it outlasts a writer that exits. Zero-filled until a writer creates it.
+    bool Create(const std::wstring& name) {
+        if (block_) return true;
+        map_ = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(GazeShmBlock), name.c_str());
+        return map_ && MapRead();
+    }
+
     bool Open(const std::wstring& name) {
         if (block_) return true;
         map_ = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
         if (!map_) return false;
+        return MapRead();
+    }
+
+private:
+    bool MapRead() {
         block_ = static_cast<const GazeShmBlock*>(MapViewOfFile(map_, FILE_MAP_READ, 0, 0, sizeof(GazeShmBlock)));
         if (!block_) {
             CloseHandle(map_);
@@ -96,6 +109,7 @@ public:
         return true;
     }
 
+public:
     // A consistent snapshot of the sample (and status), or false if the block isn't open, isn't
     // ours, or stayed mid-write for 8 attempts.
     bool Read(GazeSampleShm& out, std::string* status) const {

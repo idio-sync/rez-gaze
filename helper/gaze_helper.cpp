@@ -122,6 +122,16 @@ int main(int argc, char** argv) {
     vr::VRActionHandle_t action = vr::k_ulInvalidActionHandle;
     if (!fake) {
         vr::EVRInitError err = vr::VRInitError_None;
+        // An overlay app's VR_Init starts SteamVR if it isn't running; the helper must never do
+        // that, so first check with a background init, which only succeeds when it is.
+        if (app == "overlay") {
+            vr::VR_Init(&err, vr::VRApplication_Background);
+            if (err != vr::VRInitError_None) {
+                SetStatus(shm, std::string("vr init failed: ") + vr::VR_GetVRInitErrorAsEnglishDescription(err));
+                return 3;
+            }
+            vr::VR_Shutdown();
+        }
         sys = vr::VR_Init(&err, app == "background" ? vr::VRApplication_Background : vr::VRApplication_Overlay);
         if (err != vr::VRInitError_None) {
             SetStatus(shm, std::string("vr init failed: ") + vr::VR_GetVRInitErrorAsEnglishDescription(err));

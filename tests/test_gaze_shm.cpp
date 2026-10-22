@@ -67,6 +67,24 @@ TEST(shm_reader_before_writer) {
     EXPECT(!r.Read(out, nullptr));
 }
 
+TEST(shm_reader_created_block_outlives_writer) {
+    // The DLL creates the block before starting the helper, so a helper that fails and exits
+    // still leaves its status behind.
+    std::wstring name = TestName(L"outlive");
+    GazeShmReader r;
+    EXPECT(r.Create(name));
+    GazeSampleShm out{};
+    EXPECT(!r.Read(out, nullptr));  // no writer yet: magic not set
+    {
+        GazeShmWriter w;
+        EXPECT(w.Create(name));
+        w.SetStatus("vr init failed: no server");
+    }
+    std::string status;
+    EXPECT(r.Read(out, &status));
+    EXPECT(status == "vr init failed: no server");
+}
+
 TEST(shm_bad_magic) {
     std::wstring name = TestName(L"magic");
     GazeShmWriter w;

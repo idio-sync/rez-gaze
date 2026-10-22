@@ -40,8 +40,30 @@ target_link_libraries(rez_gaze_tests PRIVATE ws2_32)
 add_test(NAME unit COMMAND rez_gaze_tests)
 add_test(NAME helper_smoke COMMAND powershell -NoProfile -ExecutionPolicy Bypass
     -File ${CMAKE_SOURCE_DIR}/tests/helper_smoke.ps1 -Helper ${CMAKE_BINARY_DIR}/rez_gaze/rez_gaze_helper.exe)
+add_test(NAME helper_smoke_overlay COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+    -File ${CMAKE_SOURCE_DIR}/tests/helper_smoke.ps1 -Helper ${CMAKE_BINARY_DIR}/rez_gaze/rez_gaze_helper.exe -Overlay)
 add_test(NAME helper_smoke_fake COMMAND powershell -NoProfile -ExecutionPolicy Bypass
     -File ${CMAKE_SOURCE_DIR}/tests/helper_smoke.ps1 -Helper ${CMAKE_BINARY_DIR}/rez_gaze/rez_gaze_helper.exe -Fake)
+
+# Harness: the stand-in with a fake openvr_api_real.dll and the helper, laid out as in REZ\.
+set(HARNESS_DIR ${CMAKE_BINARY_DIR}/harness)
+add_library(fake_openvr_real SHARED tests/fake_openvr_real.cpp)
+set_target_properties(fake_openvr_real PROPERTIES OUTPUT_NAME openvr_api_real
+    RUNTIME_OUTPUT_DIRECTORY ${HARNESS_DIR} ARCHIVE_OUTPUT_DIRECTORY ${HARNESS_DIR}/lib)
+add_executable(proxy_harness tests/proxy_harness.cpp)
+set_target_properties(proxy_harness PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${HARNESS_DIR})
+target_compile_definitions(proxy_harness PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+add_dependencies(proxy_harness fake_openvr_real rez_gaze_proxy rez_gaze_helper)
+add_custom_command(TARGET proxy_harness POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:rez_gaze_proxy> ${HARNESS_DIR}/openvr_api.dll
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${HARNESS_DIR}/rez_gaze
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:rez_gaze_helper> ${HARNESS_DIR}/rez_gaze/
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_SOURCE_DIR}/third_party/openvr/bin/win64/openvr_api.dll ${HARNESS_DIR}/rez_gaze/
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_SOURCE_DIR}/tests/harness_rez_gaze.ini
+        ${HARNESS_DIR}/rez_gaze.ini)
+add_test(NAME harness COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+    -File ${CMAKE_SOURCE_DIR}/tests/harness.ps1 -Dir ${HARNESS_DIR})
 
 # Spike: stand-in REZ\openvr_api.dll (built into out\proxy so it doesn't clash with the probe's copy).
 add_library(rez_gaze_proxy SHARED proxy/proxy.cpp proxy/aim.cpp proxy/gaze_source.cpp proxy/forwards.cpp proxy/openvr_api.def)

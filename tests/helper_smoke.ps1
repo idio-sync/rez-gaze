@@ -4,7 +4,9 @@
 # starts SteamVR. With -Fake the helper skips OpenVR and publishes a synthetic gaze, so the
 # running path is tested without SteamVR: then "running" + "parent exited" is required, and
 # the log's sample count must be over 100.
-param([Parameter(Mandatory = $true)][string]$Helper, [switch]$Fake)
+# With -Overlay the helper runs as the DLL starts it (overlay app); if SteamVR isn't running it
+# must fail without starting any SteamVR process (no child processes left behind).
+param([Parameter(Mandatory = $true)][string]$Helper, [switch]$Fake, [switch]$Overlay)
 
 if (-not (Test-Path $Helper)) { Write-Output "FAIL: no helper at $Helper"; exit 1 }
 $log = Join-Path (Split-Path $Helper) 'rez_gaze_helper.log'
@@ -14,7 +16,8 @@ Remove-Item $log -ErrorAction SilentlyContinue
 $parent = Start-Process -PassThru -WindowStyle Hidden -FilePath ping.exe -ArgumentList '-n', '4', '127.0.0.1'
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $Helper
-$psi.Arguments = "--parent $($parent.Id) --app background" + $(if ($Fake) { ' --fake' } else { '' })
+$psi.Arguments = "--parent $($parent.Id)" + $(if ($Overlay) { '' } else { ' --app background' }) +
+                 $(if ($Fake) { ' --fake' } else { '' })
 $psi.UseShellExecute = $false  # a shell-launched process reports no ExitCode
 $psi.CreateNoWindow = $true
 $proc = [System.Diagnostics.Process]::Start($psi)
@@ -22,6 +25,11 @@ $parent.WaitForExit()
 if (-not $proc.WaitForExit(4000)) {
     $proc.Kill()
     Write-Output "FAIL: helper still running 4 s after its parent exited"
+    exit 1
+}
+$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($proc.Id)")
+if ($children.Count -gt 0) {
+    Write-Output "FAIL: the helper left child processes: $(($children | ForEach-Object Name) -join ', ')"
     exit 1
 }
 $text = if (Test-Path $log) { Get-Content $log -Raw } else { '' }
