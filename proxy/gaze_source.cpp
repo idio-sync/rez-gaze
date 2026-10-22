@@ -5,6 +5,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <cstdio>
 #include <cstring>
 #include <thread>
 
@@ -68,7 +69,7 @@ bool HelperSource::Start(const std::wstring& helper_exe, DWORD game_pid, LogFn l
             started_ = true;
             log("helper: started pid %lu", pi.dwProcessId);
             CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
+            process_ = pi.hProcess;  // kept, so a helper that dies at load still leaves its exit code
         } else {
             log("helper: can't start %ls (error %lu); gaze falls back to OSC, then head", helper_exe.c_str(),
                 GetLastError());
@@ -85,6 +86,27 @@ bool HelperSource::Read(V3& dir, double& age_ms, bool& tracked, std::string& sta
     age_ms = s.qpc ? AgeMs(s.qpc) : -1;
     tracked = (s.flags & kGazeTracked) != 0;
     return true;
+}
+
+bool HelperSource::ExitCode(DWORD& code) {
+    if (!process_ || WaitForSingleObject(process_, 0) != WAIT_OBJECT_0) return false;
+    return GetExitCodeProcess(process_, &code) != 0;
+}
+
+std::string HelperExitText(DWORD code) {
+    switch (code) {
+        case 0: return "0 (normal exit)";
+        case 2: return "2 (bad arguments)";
+        case 3: return "3 (VR init or action manifest failed; see its status)";
+        case 4: return "4 (couldn't create shared memory)";
+        case 0xC0000135: return "0xC0000135 (a DLL is missing: rez_gaze\\openvr_api.dll?)";
+        case 0xC0000005: return "0xC0000005 (crashed: access violation)";
+        default: {
+            char buf[32];
+            std::snprintf(buf, sizeof buf, "0x%08lX", code);
+            return buf;
+        }
+    }
 }
 
 // ---- OSC -----------------------------------------------------------------------------------

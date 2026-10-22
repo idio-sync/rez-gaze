@@ -1,6 +1,7 @@
 #include "test_main.h"
 
 #include "../proxy/gaze_source.h"
+#include "../shared/gaze_shm.h"
 
 #include <cmath>
 #include <cstring>
@@ -76,6 +77,50 @@ TEST(osc_bundle_is_unwrapped) {
     double age;
     EXPECT(osc.Read(d, age));
     EXPECT(Near(d.z, -1));
+}
+
+namespace {
+void NoLog(const char*, ...) {}
+}  // namespace
+
+TEST(helper_exit_code_reported) {
+    // A helper that dies at load (missing DLL, bad arguments) must still leave a reason: the
+    // started process's exit code. whoami.exe rejects "--parent N" and exits nonzero.
+    HelperSource h;
+    EXPECT(h.Start(L"C:\\Windows\\System32\\whoami.exe", 0x7FFF0001, NoLog));
+    DWORD code = 0;
+    bool exited = false;
+    for (int i = 0; i < 50 && !(exited = h.ExitCode(code)); ++i) Sleep(100);
+    EXPECT(exited);
+    EXPECT(code != 0 && code != STILL_ACTIVE);
+}
+
+TEST(helper_exit_text_names_known_codes) {
+    EXPECT(HelperExitText(0xC0000135).find("DLL") != std::string::npos);
+    EXPECT(HelperExitText(3).find("VR init") != std::string::npos);
+    EXPECT(HelperExitText(4).find("shared memory") != std::string::npos);
+}
+
+TEST(helper_read_reports_age_and_stale_is_rejected) {
+    // The DLL's block, a sample published 300 ms ago: Read must report that age, and
+    // ChooseSource must not use it.
+    DWORD pid = 0x7FFF0002;
+    HelperSource h;
+    EXPECT(!h.Start(L"C:\\nonexistent\\rez_gaze_helper.exe", pid, NoLog));  // block created, no process
+    GazeShmWriter w;
+    EXPECT(w.Create(ShmName(pid)));
+    LARGE_INTEGER now, f;
+    QueryPerformanceCounter(&now);
+    QueryPerformanceFrequency(&f);
+    w.Publish(GazeSampleShm{{0, 0, -1}, kGazeActive | kGazeValid | kGazeTracked, now.QuadPart - f.QuadPart * 3 / 10, 1});
+    V3 d;
+    double age = -1;
+    bool tracked = false;
+    std::string status;
+    EXPECT(h.Read(d, age, tracked, status));
+    EXPECT(age > 290 && age < 400);
+    EXPECT(tracked);
+    EXPECT(ChooseSource(SourceMode::Auto, age, tracked, -1) == Source::Head);
 }
 
 TEST(osc_other_addresses_ignored) {

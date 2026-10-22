@@ -42,6 +42,8 @@ add_test(NAME helper_smoke COMMAND powershell -NoProfile -ExecutionPolicy Bypass
     -File ${CMAKE_SOURCE_DIR}/tests/helper_smoke.ps1 -Helper ${CMAKE_BINARY_DIR}/rez_gaze/rez_gaze_helper.exe)
 add_test(NAME helper_smoke_overlay COMMAND powershell -NoProfile -ExecutionPolicy Bypass
     -File ${CMAKE_SOURCE_DIR}/tests/helper_smoke.ps1 -Helper ${CMAKE_BINARY_DIR}/rez_gaze/rez_gaze_helper.exe -Overlay)
+add_test(NAME helper_smoke_hang COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+    -File ${CMAKE_SOURCE_DIR}/tests/helper_smoke.ps1 -Helper ${CMAKE_BINARY_DIR}/rez_gaze/rez_gaze_helper.exe -Hang)
 add_test(NAME helper_smoke_fake COMMAND powershell -NoProfile -ExecutionPolicy Bypass
     -File ${CMAKE_SOURCE_DIR}/tests/helper_smoke.ps1 -Helper ${CMAKE_BINARY_DIR}/rez_gaze/rez_gaze_helper.exe -Fake)
 

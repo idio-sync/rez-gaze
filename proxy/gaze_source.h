@@ -25,6 +25,9 @@ const char* SourceName(Source s);
 
 using LogFn = void (*)(const char* fmt, ...);
 
+// What a helper exit code means (its own codes, and the loader's missing-DLL status).
+std::string HelperExitText(DWORD code);
+
 // Starts rez_gaze_helper.exe once per process and reads its block.
 class HelperSource {
 public:
@@ -32,11 +35,14 @@ public:
     bool Start(const std::wstring& helper_exe, DWORD game_pid, LogFn log);
     // False until the helper's block exists and reads consistently.
     bool Read(V3& dir, double& age_ms, bool& tracked, std::string& status);
+    // True once the started process has exited, with its exit code.
+    bool ExitCode(DWORD& code);
 
 private:
     std::once_flag once_;
     bool started_ = false;
     DWORD game_pid_ = 0;
+    HANDLE process_ = nullptr;
     struct Reader;
     Reader* reader_ = nullptr;
 };

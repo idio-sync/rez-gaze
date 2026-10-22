@@ -1,4 +1,4 @@
-# Smoke test for rez_gaze_helper.exe: started with a short-lived parent, it must exit within 4 s
+# Smoke test for rez_gaze_helper.exe: started with a short-lived parent, it must exit within 1 s
 # of the parent, and its log must show either "vr init failed" (SteamVR not running) or
 # "running" followed by "parent exited". Runs the helper as a background app, which never
 # starts SteamVR. With -Fake the helper skips OpenVR and publishes a synthetic gaze, so the
@@ -6,7 +6,9 @@
 # the log's sample count must be over 100.
 # With -Overlay the helper runs as the DLL starts it (overlay app); if SteamVR isn't running it
 # must fail without starting any SteamVR process (no child processes left behind).
-param([Parameter(Mandatory = $true)][string]$Helper, [switch]$Fake, [switch]$Overlay)
+# With -Hang the helper blocks forever where VR init would be (--fake-hang); its parent watchdog
+# must still end it within 1 s of the parent exiting.
+param([Parameter(Mandatory = $true)][string]$Helper, [switch]$Fake, [switch]$Overlay, [switch]$Hang)
 
 if (-not (Test-Path $Helper)) { Write-Output "FAIL: no helper at $Helper"; exit 1 }
 $log = Join-Path (Split-Path $Helper) 'rez_gaze_helper.log'
@@ -17,14 +19,14 @@ $parent = Start-Process -PassThru -WindowStyle Hidden -FilePath ping.exe -Argume
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $Helper
 $psi.Arguments = "--parent $($parent.Id)" + $(if ($Overlay) { '' } else { ' --app background' }) +
-                 $(if ($Fake) { ' --fake' } else { '' })
+                 $(if ($Fake) { ' --fake' } else { '' }) + $(if ($Hang) { ' --fake-hang' } else { '' })
 $psi.UseShellExecute = $false  # a shell-launched process reports no ExitCode
 $psi.CreateNoWindow = $true
 $proc = [System.Diagnostics.Process]::Start($psi)
 $parent.WaitForExit()
-if (-not $proc.WaitForExit(4000)) {
+if (-not $proc.WaitForExit(1000)) {
     $proc.Kill()
-    Write-Output "FAIL: helper still running 4 s after its parent exited"
+    Write-Output "FAIL: helper still running 1 s after its parent exited"
     exit 1
 }
 $children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($proc.Id)")
@@ -35,6 +37,11 @@ if ($children.Count -gt 0) {
 $text = if (Test-Path $log) { Get-Content $log -Raw } else { '' }
 Write-Output "helper exit code $($proc.ExitCode)"
 Write-Output $text
+if ($Hang) {
+    if ($text -match 'watchdog') { Write-Output 'PASS (hang)'; exit 0 }
+    Write-Output 'FAIL: hang run lacks the watchdog line'
+    exit 1
+}
 if ($Fake) {
     $ok = $text -match 'status running' -and $text -match 'status parent exited' -and
           $text -match '(\d+) samples, \d+ tracked' -and [int64]$Matches[1] -gt 100

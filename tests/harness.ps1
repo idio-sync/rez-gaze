@@ -2,6 +2,9 @@
 # (--helper-missing). Afterwards no helper from out\harness may still be running.
 param([Parameter(Mandatory = $true)][string]$Dir)
 
+# CTest passes forward slashes; process paths use backslashes.
+$Dir = (Resolve-Path $Dir).Path
+
 $exe = Join-Path $Dir 'proxy_harness.exe'
 $helperDir = Join-Path $Dir 'rez_gaze'
 $aside = Join-Path $Dir 'rez_gaze_aside'

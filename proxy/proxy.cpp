@@ -199,11 +199,31 @@ int DeviceClass(vr::TrackedDeviceIndex_t i) {
     return reinterpret_cast<FnClass>((*reinterpret_cast<void***>(g_system))[19])(g_system, i);
 }
 
+// The helper's status changes, and its exit code once if it has died, in every mode.
+void LogHelperState() {
+    V3 d;
+    double age;
+    bool tracked;
+    std::string status;
+    if (g_helper.Read(d, age, tracked, status) && status != g_helper_status) {
+        Log("helper status \"%s\"", status.c_str());
+        g_helper_status = status;
+    }
+    static bool exit_logged = false;
+    DWORD code;
+    if (!exit_logged && g_helper.ExitCode(code)) {
+        Log("helper exited with code %s; gaze falls back to OSC, then head",
+            rezgaze::HelperExitText(code).c_str());
+        exit_logged = true;
+    }
+}
+
 void RefreshEverySecond() {
     static LONGLONG last = 0;
     LONGLONG now = Qpc();
     if (now - last < g_qpf) return;
     last = now;
+    LogHelperState();
     Config c = ReadConfig();
     {
         std::lock_guard<std::mutex> lock(g_cfg_mutex);
@@ -256,10 +276,6 @@ V3 HeadGaze(const Config& c) {
     std::string status;
     if (!g_helper.Read(helper_dir, helper_age, helper_tracked, status)) helper_age = -1;
     if (!g_osc.Read(osc_dir, osc_age)) osc_age = -1;
-    if (status != g_helper_status) {
-        Log("helper status \"%s\"", status.c_str());
-        g_helper_status = status;
-    }
     rezgaze::Source src = rezgaze::ChooseSource(c.source, helper_age, helper_tracked, osc_age);
     if (src != g_source) {
         Log("gaze source %s -> %s (helper age %.0f ms%s, osc age %.0f ms)", rezgaze::SourceName(g_source),

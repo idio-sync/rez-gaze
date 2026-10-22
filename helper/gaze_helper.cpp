@@ -6,7 +6,8 @@
 //
 //   rez_gaze_helper.exe --parent <pid> [--app overlay|background] [--hz 250] [--fake]
 // --fake skips OpenVR and publishes a tracked gaze sweeping a 10 degree circle every 4 s, for
-// testing the DLL and the helper's lifetime without SteamVR.
+// testing the DLL and the helper's lifetime without SteamVR. --fake-hang blocks forever where VR
+// init would be, to test that a helper stuck in OpenVR still exits with the game.
 // Exit codes: 0 normal, 2 bad arguments, 3 VR init or manifest failed, 4 shared memory failed.
 #include "../shared/gaze_shm.h"
 
@@ -20,6 +21,7 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -86,11 +88,12 @@ int main(int argc, char** argv) {
     DWORD parent_pid = 0;
     std::string app = "overlay";
     int hz = 250;
-    bool fake = false;
+    bool fake = false, fake_hang = false;
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         std::string v = i + 1 < argc ? argv[i + 1] : "";
         if (a == "--fake") fake = true;
+        else if (a == "--fake-hang") fake_hang = true;
         else if (a == "--parent") parent_pid = std::strtoul(v.c_str(), nullptr, 10), ++i;
         else if (a == "--app") app = v, ++i;
         else if (a == "--hz") hz = std::atoi(v.c_str()), ++i;
@@ -115,6 +118,21 @@ int main(int argc, char** argv) {
     if (!parent) {
         SetStatus(shm, "parent exited");
         return 0;
+    }
+    // The main loop checks the parent too, but OpenVR calls can block (VR_Init takes ~4 s to be
+    // refused with no headset, and a hung vrserver can block indefinitely). This watchdog ends
+    // the helper within 500 ms of the game exiting, whatever the main thread is doing; the main
+    // loop normally exits first and cleanly (status, VR_Shutdown). It writes only the log: the
+    // shared memory has one writer, the main thread.
+    std::thread([parent] {
+        WaitForSingleObject(parent, INFINITE);
+        Sleep(500);
+        Log("parent exited (watchdog)");
+        ExitProcess(0);
+    }).detach();
+    if (fake_hang) {
+        SetStatus(shm, "starting");
+        Sleep(INFINITE);
     }
 
     vr::IVRSystem* sys = nullptr;
