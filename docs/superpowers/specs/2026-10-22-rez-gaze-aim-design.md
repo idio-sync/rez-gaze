@@ -1,7 +1,7 @@
 # Rez Infinite eye-gaze aiming — design (draft, 2026-10-22)
 
-Status: draft for the user's review. Items marked **(my call)** are decisions made without the
-user; items under "Open questions" need the user's answer.
+Status: the user answered the open questions and accepted the recommendations on 2026-10-22
+(see "Decisions"). Items marked **(my call)** are decisions made without the user.
 
 ## Intent
 
@@ -14,7 +14,9 @@ prefers it to aiming with the controller.
 ## Goals
 
 - Eye-gaze aiming in classic Rez (`REZ\REZ.exe`, Areas 1–5 and the rest of that program) in VR,
-  with the Frame streamed from the PC through Steam Link.
+  with the Frame streamed from the PC through Steam Link, **and** with Rez running standalone on
+  the Frame under Proton/FEX. The user wants both. The PC comes first because it's the one
+  proven so far.
 - No changes to the game's files apart from adding DLLs and an ini; one step to install and one
   to remove.
 - Runs beside the frame-rate mod (`rez_hfr`, `REZ\XINPUT1_3.dll`) without either getting in the
@@ -23,11 +25,10 @@ prefers it to aiming with the controller.
 
 ## Non-goals (v1)
 
-- Area X (`AX\`, Unreal Engine 4). See open question 1.
-- Running Rez on the headset itself (Proton/FEX). The Steam Link OSC stream this design uses
-  exists only when streaming from a PC. See open question 4.
-- Aim assist that knows enemy positions. See open question 2.
-- Headsets other than the Steam Frame, and gaze sources other than Steam Link.
+- Area X (`AX\`, Unreal Engine 4). Later, per the user.
+- Aim assist that knows enemy positions. Measure the hit rate first.
+- A controller gesture to switch back to controller aim. The ini's `enabled=0` does it.
+- Headsets other than the Steam Frame.
 
 ## Anti-goals
 
@@ -75,34 +76,59 @@ One DLL: a stand-in `REZ\openvr_api.dll`. The game's own DLL is renamed `openvr_
   for `openvr_api_real.DLL` (uppercase), and the other session had to add a copy to make Rez
   start.
 
-### Gaze source: Steam Link's OSC stream, read inside the DLL (my call)
+### Gaze source: a helper the DLL starts, with Steam Link OSC as the PC fallback
 
-A thread in the DLL listens on UDP `127.0.0.1:9000` and keeps the latest gaze direction and its
-time.
+The primary source is **`rez_gaze_helper.exe`**, which sits beside the DLL. It's a small OpenVR
+overlay app that reads the `eyetracking` action (`IVRInput::GetEyeTrackingDataRelativeToNow`)
+and publishes gaze to the DLL through named shared memory. Accepted by the user on 2026-10-22.
 
-Why OSC rather than the OpenVR route:
+Why a helper:
 
-- The OpenVR route can't run inside `REZ.exe`. Setting an action manifest switches the app from
-  legacy input to SteamVR Input, and Rez's controls depend on legacy input.
-- So the OpenVR route would need a second process plus shared memory, which is one more thing to
-  start and keep running.
-- 57 samples/s is close to the game's 60 Hz cursor tick.
+- **Standalone needs it.** Steam Link's OSC exists only when streaming from a PC. On the
+  headset there is no Steam Link, so OSC can't work there.
+- **It's the same Windows code everywhere.** Under Proton the helper is the same exe, and Wine
+  gives both processes the same named shared memory.
+- **The OpenVR route can't run inside `REZ.exe`.** Setting an action manifest flips the app
+  from legacy input to SteamVR Input, and Rez's controls depend on legacy input. Hence a second
+  process.
+- **It's proven on the PC.** Beside `REZ.exe` it gave 100% tracked gaze at ~186 samples/s,
+  against OSC's ~57/s.
+- **On the PC it doesn't need "Enable OSC"**, only "Share eye tracking data".
 
-The fallback is a small helper exe using the OpenVR overlay route, feeding the DLL through
-shared memory. **v1 builds only the `GazeSource` seam, not the helper (my call).**
+**The DLL starts the helper**, so nothing has to be started by hand on either platform.
 
-The helper gets built if either of these holds:
+- It does this the first time the game asks for `IVRSystem_015`. SteamVR is running by then, so
+  the overlay app type can't start SteamVR itself.
+- It passes the game's PID and the mapping name on the command line.
+- The helper exits when the game process exits, or when SteamVR asks it to quit.
+- A flat (non-VR) run never starts it.
 
-- on the headset, OSC's median latency trails the OpenVR route's by more than 17 ms (one game
-  tick), measured by logging both on the same eye movements;
-- the user finds the aim laggy, and the filter isn't the cause.
+**The shared memory (my call)** is `Local\rez_gaze_<game pid>`, a small struct written under a
+sequence lock:
 
-At 57 samples/s against the 60 Hz tick, about one tick in 20 repeats the previous sample. At
-fixation that's invisible, and in a saccade it adds at most one tick. Acceptable.
+- magic and version;
+- sequence number and sample counter;
+- the sample time as a QueryPerformanceCounter value (same machine, and under Wine the same
+  prefix);
+- head-space gaze direction, −Z forward;
+- flags: active, valid, tracked;
+- the helper's PID and a short status text for the DLL's log.
 
-If no OSC arrives for 250 ms, aiming falls back to head-forward. The log says why: the settings
-are off, or the port is taken (VRChat and similar OSC tools use 9000; the port is configurable,
-and Steam Link offers 9015).
+**The gaze is head-relative.** The helper reads eye data and the head pose at the same moment
+and converts. The DLL then applies it to the head pose from `WaitGetPoses`. This keeps the
+helper's and the game's different pose predictions from skewing the aim.
+
+**Fallback order, `source=auto` (my call).** Use the helper if it has published within 250 ms.
+Otherwise use OSC, if packets are arriving on the PC. Otherwise aim at head-forward, and log why:
+- the helper failed to start, and its status says why;
+- the settings are off;
+- the port is taken (VRChat and similar OSC tools use 9000; the port is configurable, and Steam
+  Link offers 9015).
+
+`source=helper|osc` forces one, for comparisons.
+
+**Latency** is compared on the headset by logging both sources over the same eye movements.
+A gap under a game tick (17 ms) doesn't matter.
 
 ### Aim
 
@@ -117,8 +143,13 @@ Leave the HMD entry, validity flags and velocities alone.
 
 - **Both hands are rewritten (my call).** The game aims with whichever controller was last
   "selected" by a button press, so rewriting both means it doesn't matter which one that was.
-- **Real controller aim is lost while the mod is active.** That is the point of the mod; see open
-  question 3 for a way to switch back mid-game.
+- **Real controller aim is lost while the mod is active.** That is the point of the mod.
+  `enabled=0` in the ini switches back within a second. A controller gesture was deferred
+  because it would need a button Rez doesn't use, and Rez's use of the Frame's buttons isn't
+  mapped yet.
+- **Buttons are untouched.** The user fires with the Frame's A button. Under the
+  oculus-simulation path any button press selects a controller and sets the VR input device;
+  the first headset step confirms this.
 - **Menus.** The menu pointer also follows the controller, so menus follow gaze too. That's the
   default **(my call)**; an ini switch keeps menus on head or controller if it's annoying.
 
@@ -179,6 +210,7 @@ VR control type must be "motion controller only".
 | `filter_beta` | number | 0.02 |
 | `trim_yaw`, `trim_pitch` | degrees | 0 |
 | `tilt` | auto/degrees | auto |
+| `source` | auto/helper/osc | auto |
 | `osc_port` | port | 9000 |
 | `log` | 0/1 | 1 |
 
@@ -238,7 +270,45 @@ the other's DLL or files.
 - **Coordination.** Message the frame-rate session before any launch, and never launch while
   another Rez is running.
 
-## Open questions for the user
+## Standalone on the Frame (Proton/FEX)
+
+The user already runs Rez on the headset this way.
+
+- **The DLL.** Wine loads a game-folder `openvr_api.dll` like Windows does, so the same DLL and
+  helper go into the on-device install's `REZ\` folder.
+- **Access.** Vitrine3D's frame-viewer reaches the headset over SSH: `steamos@frame`, through
+  `adb forward` on the USB cable (`Vitrine3D/apps/frame-viewer/deploy.sh`). The same route can
+  copy files in and pull logs back.
+- **Unknowns, tested in this order:**
+  1. Does the DLL load and hook under Proton? Log mode.
+  2. Does Proton's OpenVR bridge pass through `IVRInput` eye tracking? It's newer than most of
+     the API (SDK 2.15). Run the helper; or run `gaze_probe openvr` the same way.
+  3. Does on-device SteamVR give gaze to an overlay app while Rez is in front?
+  4. Does named shared memory work between the two Wine processes? Expected, since they share
+     one wineserver.
+- **If step 2 or 3 fails,** the options are:
+  - a native arm64 helper (OpenVR or OpenXR) feeding a file or socket the DLL reads. Shared
+    memory doesn't cross the Wine boundary, so a socket would be needed.
+  - The `GazeSource` seam keeps that change local.
+
+## Decisions (2026-10-22, from the user)
+
+- **Fire input:** the Frame's A button, through the controller. No gamepad.
+- **Area X:** later.
+- **Aim assist:** not in v1. Measure the hit rate first (recommended and accepted).
+- **Switching back:** the ini only in v1 (recommended and accepted).
+- **Standalone:** wanted. Hence the helper as the primary gaze source (recommended and
+  accepted).
+- **Build order:**
+  1. PC go/no-go (log, then head).
+  2. Helper, tested on the PC.
+  3. Standalone go/no-go.
+  4. The full mod for both.
+
+  The helper is built and smoke-tested while the user is away: it builds, starts and exits
+  cleanly without gaze.
+
+## Questions as asked (kept for the record)
 
 0. **What do you fire with?** The Frame controllers' triggers, or a gamepad?
    - The game aims through the VR path only while its last input came from a VR controller.
