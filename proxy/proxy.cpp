@@ -21,6 +21,9 @@
 //                          auto = 39.4 when the tracking system is "oculus", else 0
 //   yaw=0, pitch=0         trim in head space, degrees (positive = right, up)
 //   smooth_ms=0            exponential smoothing of the gaze direction
+//   source=auto|helper|osc gaze from the helper (rez_gaze\rez_gaze_helper.exe, started on the
+//                          first IVRSystem_015) if fresh, else Steam Link OSC, else straight
+//                          ahead; helper/osc forces one
 //   port=9000              OSC port (read at start only)
 // Log: rez_gaze.log beside the DLL.
 #include <winsock2.h>
@@ -30,6 +33,7 @@
 #include <openvr.h>
 
 #include "aim.h"
+#include "gaze_source.h"
 
 #include <atomic>
 #include <cmath>
@@ -70,6 +74,7 @@ struct Config {
     bool tilt_auto = true;
     double tilt = 0, pitch = 0, yaw = 0, smooth_ms = 0;
     int port = 9000;
+    rezgaze::SourceMode source = rezgaze::SourceMode::Auto;
 };
 
 Config g_cfg;
@@ -96,21 +101,21 @@ Config ReadConfig() {
     c.yaw = num(L"yaw", 0);
     c.smooth_ms = num(L"smooth_ms", 0);
     c.port = static_cast<int>(num(L"port", 9000));
+    GetPrivateProfileStringW(L"rez_gaze", L"source", L"auto", buf, 64, ini.c_str());
+    c.source = _wcsicmp(buf, L"helper") == 0 ? rezgaze::SourceMode::Helper
+               : _wcsicmp(buf, L"osc") == 0  ? rezgaze::SourceMode::Osc
+                                             : rezgaze::SourceMode::Auto;
     return c;
 }
 
 const char* ModeName(Mode m) { return m == Mode::Head ? "head" : m == Mode::Gaze ? "gaze" : "log"; }
 
-// ---- gaze from OSC -------------------------------------------------------------------------
+// ---- gaze sources -------------------------------------------------------------------------
 
 using rezgaze::Mat3;
 using rezgaze::Norm;
 using rezgaze::V3;
 
-std::mutex g_gaze_mutex;
-V3 g_gaze{0, 0, -1};          // head space, -Z forward
-LONGLONG g_gaze_qpc = 0;      // when it arrived
-std::atomic<long> g_gaze_packets{0};
 LONGLONG g_qpf = 1;
 
 LONGLONG Qpc() {
@@ -119,58 +124,10 @@ LONGLONG Qpc() {
     return c.QuadPart;
 }
 
-float BeFloat(const unsigned char* p) {
-    uint32_t u = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
-    float f;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-
-// Finds /tracking/eye/CenterVecFull ,fff in a packet (plain message or bundle).
-void HandlePacket(const unsigned char* p, size_t n) {
-    if (n >= 16 && std::memcmp(p, "#bundle", 8) == 0) {
-        size_t off = 16;
-        while (off + 4 <= n) {
-            uint32_t len = (uint32_t(p[off]) << 24) | (uint32_t(p[off + 1]) << 16) |
-                           (uint32_t(p[off + 2]) << 8) | p[off + 3];
-            off += 4;
-            if (off + len > n) return;
-            HandlePacket(p + off, len);
-            off += len;
-        }
-        return;
-    }
-    static const char kAddr[] = "/tracking/eye/CenterVecFull";  // 27 chars, padded to 28
-    if (n < 28 + 8 + 12 || std::memcmp(p, kAddr, sizeof kAddr) != 0) return;
-    if (std::memcmp(p + 28, ",fff", 4) != 0) return;
-    const unsigned char* a = p + 28 + 8;
-    // VRChat's convention is +Z forward.
-    V3 g = Norm({BeFloat(a), BeFloat(a + 4), -BeFloat(a + 8)});
-    std::lock_guard<std::mutex> lock(g_gaze_mutex);
-    g_gaze = g;
-    g_gaze_qpc = Qpc();
-    ++g_gaze_packets;
-}
-
-void OscThread(int port) {
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
-    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(static_cast<u_short>(port));
-    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
-    if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) {
-        Log("OSC: can't bind 127.0.0.1:%d (error %d); gaze mode falls back to head", port, WSAGetLastError());
-        return;
-    }
-    Log("OSC: listening on 127.0.0.1:%d", port);
-    unsigned char buf[4096];
-    for (;;) {
-        int n = recv(s, reinterpret_cast<char*>(buf), sizeof buf, 0);
-        if (n > 0) HandlePacket(buf, static_cast<size_t>(n));
-    }
-}
+rezgaze::HelperSource g_helper;
+rezgaze::OscSource g_osc;
+rezgaze::Source g_source = rezgaze::Source::Head;  // the last one used
+std::string g_helper_status;
 
 // ---- pose rewriting ------------------------------------------------------------------------
 
@@ -290,18 +247,28 @@ void SetRotation(vr::HmdMatrix34_t& m, const Mat3& r) {
     }
 }
 
-// Gaze direction in head space, smoothed there (so head turns aren't smoothed); straight ahead
-// when no recent OSC.
+// Gaze direction in head space from the chosen source, smoothed there (so head turns aren't
+// smoothed); straight ahead when neither source has fresh gaze.
 V3 HeadGaze(const Config& c) {
-    V3 g;
-    LONGLONG at;
-    {
-        std::lock_guard<std::mutex> lock(g_gaze_mutex);
-        g = g_gaze;
-        at = g_gaze_qpc;
+    V3 helper_dir, osc_dir, g{0, 0, -1};
+    double helper_age = -1, osc_age = -1;
+    bool helper_tracked = false;
+    std::string status;
+    if (!g_helper.Read(helper_dir, helper_age, helper_tracked, status)) helper_age = -1;
+    if (!g_osc.Read(osc_dir, osc_age)) osc_age = -1;
+    if (status != g_helper_status) {
+        Log("helper status \"%s\"", status.c_str());
+        g_helper_status = status;
     }
+    rezgaze::Source src = rezgaze::ChooseSource(c.source, helper_age, helper_tracked, osc_age);
+    if (src != g_source) {
+        Log("gaze source %s -> %s (helper age %.0f ms%s, osc age %.0f ms)", rezgaze::SourceName(g_source),
+            rezgaze::SourceName(src), helper_age, helper_tracked ? " tracked" : "", osc_age);
+        g_source = src;
+    }
+    if (src == rezgaze::Source::Helper) g = helper_dir;
+    else if (src == rezgaze::Source::Osc) g = osc_dir;
     LONGLONG now = Qpc();
-    if (at == 0 || now - at > g_qpf / 4) g = {0, 0, -1};
     if (c.smooth_ms > 0 && g_smoothed_qpc) {
         double dt_ms = (now - g_smoothed_qpc) * 1000.0 / g_qpf;
         double k = 1 - std::exp(-dt_ms / c.smooth_ms);
@@ -359,16 +326,16 @@ void ReportEveryFiveSeconds() {
         long v = c->n.exchange(0);
         if (v) s += std::string(" ") + c->name + "=" + std::to_string(v);
     }
-    LONGLONG at;
-    V3 g;
-    {
-        std::lock_guard<std::mutex> lock(g_gaze_mutex);
-        at = g_gaze_qpc;
-        g = g_gaze;
-    }
-    Log("5 s:%s | rewrites=%ld | osc packets=%ld, last %.0f ms ago, gaze %.3f %.3f %.3f", s.c_str(),
-        g_rewrites.exchange(0), g_gaze_packets.exchange(0), at ? (now - at) * 1000.0 / g_qpf : -1.0, g.x,
-        g.y, g.z);
+    V3 hd, od;
+    double helper_age = -1, osc_age = -1;
+    bool tracked = false;
+    std::string status;
+    if (!g_helper.Read(hd, helper_age, tracked, status)) helper_age = -1;
+    if (!g_osc.Read(od, osc_age)) osc_age = -1;
+    Log("5 s:%s | rewrites=%ld | source %s | helper \"%s\" age %.0f ms%s, gaze %.3f %.3f %.3f | osc packets=%ld "
+        "age %.0f ms",
+        s.c_str(), g_rewrites.exchange(0), rezgaze::SourceName(g_source), status.c_str(), helper_age,
+        tracked ? " tracked" : "", hd.x, hd.y, hd.z, g_osc.TakePacketCount(), osc_age);
     RezState st;
     if (ReadRezState(st)) {
         static const char* kTypes[] = {"head+controller (drifts past 30 deg; use controller only)",
@@ -485,7 +452,7 @@ void Init(HMODULE self) {
         return;
     }
     g_real_get_generic = reinterpret_cast<FnGetGeneric>(GetProcAddress(real, "VR_GetGenericInterface"));
-    std::thread(OscThread, g_cfg.port).detach();
+    g_osc.Start(g_cfg.port, Log);
 }
 
 }  // namespace
@@ -506,6 +473,9 @@ extern "C" void* __cdecl VR_GetGenericInterface(const char* version, vr::EVRInit
     if (!obj) return obj;
     if (std::strcmp(version, "IVRSystem_015") == 0) {
         g_system = static_cast<vr::IVRSystem*>(obj);
+        // VR is up (SteamVR running), so the helper's overlay app can't start SteamVR itself.
+        // Once per process; flat runs never get here.
+        g_helper.Start(g_dir + L"rez_gaze\\rez_gaze_helper.exe", GetCurrentProcessId(), Log);
         Patch(obj, 10, &HookAbs, g_orig_abs, "IVRSystem::GetDeviceToAbsoluteTrackingPose");
         Patch(obj, 17, &HookRole, g_orig_role_to_index, "IVRSystem::GetTrackedDeviceIndexForControllerRole");
         Patch(obj, 29, &HookEventPose, g_orig_event_pose, "IVRSystem::PollNextEventWithPose");
