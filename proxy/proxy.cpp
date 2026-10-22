@@ -19,7 +19,7 @@
 //   hand=right|left|both   which controller(s) to rewrite
 //   tilt=auto              degrees about the controller's X added to undo the game's offset;
 //                          auto = 39.4 when the tracking system is "oculus", else 0
-//   pitch=0, yaw=0         further degrees in the controller's own frame (tuning)
+//   yaw=0, pitch=0         trim in head space, degrees (positive = right, up)
 //   smooth_ms=0            exponential smoothing of the gaze direction
 //   port=9000              OSC port (read at start only)
 // Log: rez_gaze.log beside the DLL.
@@ -28,6 +28,8 @@
 #include <windows.h>
 
 #include <openvr.h>
+
+#include "aim.h"
 
 #include <atomic>
 #include <cmath>
@@ -101,18 +103,9 @@ const char* ModeName(Mode m) { return m == Mode::Head ? "head" : m == Mode::Gaze
 
 // ---- gaze from OSC -------------------------------------------------------------------------
 
-struct V3 {
-    double x = 0, y = 0, z = 0;
-};
-V3 operator+(V3 a, V3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
-V3 operator-(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
-V3 operator*(V3 a, double s) { return {a.x * s, a.y * s, a.z * s}; }
-double Dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
-V3 Cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
-V3 Norm(V3 a) {
-    double l = std::sqrt(Dot(a, a));
-    return l > 1e-9 ? a * (1 / l) : V3{0, 0, -1};
-}
+using rezgaze::Mat3;
+using rezgaze::Norm;
+using rezgaze::V3;
 
 std::mutex g_gaze_mutex;
 V3 g_gaze{0, 0, -1};          // head space, -Z forward
@@ -283,16 +276,23 @@ void RefreshEverySecond() {
     }
 }
 
-V3 Col(const vr::HmdMatrix34_t& m, int c) { return {m.m[0][c], m.m[1][c], m.m[2][c]}; }
-V3 Pos(const vr::HmdMatrix34_t& m) { return {m.m[0][3], m.m[1][3], m.m[2][3]}; }
-void SetCol(vr::HmdMatrix34_t& m, int c, V3 v) {
-    m.m[0][c] = (float)v.x;
-    m.m[1][c] = (float)v.y;
-    m.m[2][c] = (float)v.z;
+Mat3 Rotation(const vr::HmdMatrix34_t& m) {
+    Mat3 r;
+    for (int c = 0; c < 3; ++c) r.col[c] = {m.m[0][c], m.m[1][c], m.m[2][c]};
+    return r;
 }
 
-// Gaze direction in world space, smoothed; head forward when no recent OSC.
-V3 WorldGaze(const vr::HmdMatrix34_t& head, const Config& c) {
+void SetRotation(vr::HmdMatrix34_t& m, const Mat3& r) {
+    for (int c = 0; c < 3; ++c) {
+        m.m[0][c] = (float)r.col[c].x;
+        m.m[1][c] = (float)r.col[c].y;
+        m.m[2][c] = (float)r.col[c].z;
+    }
+}
+
+// Gaze direction in head space, smoothed there (so head turns aren't smoothed); straight ahead
+// when no recent OSC.
+V3 HeadGaze(const Config& c) {
     V3 g;
     LONGLONG at;
     {
@@ -302,31 +302,14 @@ V3 WorldGaze(const vr::HmdMatrix34_t& head, const Config& c) {
     }
     LONGLONG now = Qpc();
     if (at == 0 || now - at > g_qpf / 4) g = {0, 0, -1};
-    V3 w = Norm(Col(head, 0) * g.x + Col(head, 1) * g.y + Col(head, 2) * g.z);
     if (c.smooth_ms > 0 && g_smoothed_qpc) {
         double dt_ms = (now - g_smoothed_qpc) * 1000.0 / g_qpf;
         double k = 1 - std::exp(-dt_ms / c.smooth_ms);
-        w = Norm(g_smoothed + (w - g_smoothed) * k);
+        g = Norm(g_smoothed + (g - g_smoothed) * k);
     }
-    g_smoothed = w;
+    g_smoothed = g;
     g_smoothed_qpc = now;
-    return w;
-}
-
-// Rotation whose -Z points along f, roll taken from the head's up, then yaw and pitch (tilt +
-// pitch) in its own frame.
-void Aim(vr::HmdMatrix34_t& m, V3 f, V3 up, const Config& c) {
-    V3 z = f * -1;
-    V3 x = Norm(Cross(up, z));
-    V3 y = Cross(z, x);
-    double tilt = c.tilt_auto ? (g_is_oculus ? 39.4 : 0.0) : c.tilt;
-    double p = (tilt + c.pitch) * 3.14159265358979 / 180, w = c.yaw * 3.14159265358979 / 180;
-    // yaw about local y, then pitch about local x
-    V3 x1 = x * std::cos(w) - z * std::sin(w), z1 = x * std::sin(w) + z * std::cos(w);
-    V3 y2 = y * std::cos(p) + z1 * std::sin(p), z2 = z1 * std::cos(p) - y * std::sin(p);
-    SetCol(m, 0, x1);
-    SetCol(m, 1, y2);
-    SetCol(m, 2, z2);
+    return g;
 }
 
 std::atomic<long> g_rewrites{0};
@@ -339,14 +322,15 @@ void Rewrite(vr::TrackedDevicePose_t* poses, uint32_t n) {
         c = g_cfg;
     }
     if (c.mode == Mode::Log || !poses[0].bPoseIsValid) return;
-    const vr::HmdMatrix34_t& head = poses[0].mDeviceToAbsoluteTracking;
     // The game projects the controller ray 400 m out, so the hand's offset from the head
-    // doesn't matter: aim along the world gaze direction from wherever the hand is.
-    V3 dir = c.mode == Mode::Gaze ? WorldGaze(head, c) : Norm(Col(head, 2) * -1);
+    // doesn't matter: only the rotation is rewritten.
+    V3 gaze = c.mode == Mode::Gaze ? HeadGaze(c) : V3{0, 0, -1};
+    double tilt = c.tilt_auto ? (g_is_oculus ? 39.4 : 0.0) : c.tilt;
+    Mat3 aim = rezgaze::AimRotation(Rotation(poses[0].mDeviceToAbsoluteTracking), gaze, tilt, c.yaw, c.pitch);
     for (vr::TrackedDeviceIndex_t i : {c.right ? g_right : vr::k_unTrackedDeviceIndexInvalid,
                                        c.left ? g_left : vr::k_unTrackedDeviceIndexInvalid}) {
         if (i == vr::k_unTrackedDeviceIndexInvalid || i >= n || !poses[i].bPoseIsValid) continue;
-        Aim(poses[i].mDeviceToAbsoluteTracking, dir, Col(head, 1), c);
+        SetRotation(poses[i].mDeviceToAbsoluteTracking, aim);
         ++g_rewrites;
     }
 }
