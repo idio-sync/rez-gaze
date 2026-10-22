@@ -19,6 +19,12 @@ target_link_libraries(gaze_probe PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/openvr/lib/win64/openvr_api.lib
     winmm d3d11 dxgi ws2_32)
 
+# Unit tests (ctest --test-dir out).
+enable_testing()
+add_executable(rez_gaze_tests tests/test_main.cpp tests/test_gaze_shm.cpp)
+target_compile_definitions(rez_gaze_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+add_test(NAME unit COMMAND rez_gaze_tests)
+
 # Spike: stand-in REZ\openvr_api.dll (built into out\proxy so it doesn't clash with the probe's copy).
 add_library(rez_gaze_proxy SHARED proxy/proxy.cpp proxy/forwards.cpp proxy/openvr_api.def)
 set_target_properties(rez_gaze_proxy PROPERTIES
