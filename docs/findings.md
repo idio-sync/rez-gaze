@@ -111,6 +111,31 @@ Out Port: 9000":
 - Not yet measured: latency of each route (gaze change → value), and accuracy against known
   targets.
 
+## Helper milestone (2026-10-22, offline: SteamVR off, user away)
+
+Branch `gaze-helper`; plan `docs/superpowers/plans/2026-10-22-gaze-helper.md`.
+
+- **`rez_gaze_helper.exe`.** An OpenVR overlay app. It reads the `eyetracking` action and
+  publishes head-relative gaze to `Local\rez_gaze_<game pid>` at about 205 Hz. It exits within
+  milliseconds of the game exiting.
+- **The DLL starts it** on the first `IVRSystem_015`. The DLL creates the block first, so a
+  helper that fails still leaves its status for the DLL's log.
+- **Source choice.** The DLL uses the helper if it published within 250 ms, otherwise OSC,
+  otherwise straight ahead (`source=auto|helper|osc`).
+- **Tested without the game or SteamVR:**
+  - 19 unit tests: seqlock, aim math against the decompiled cursor formula, source choice and
+    the OSC parser;
+  - helper smoke runs: background, overlay, and `--fake`;
+  - a harness with a fake `openvr_api_real.dll`.
+- **Found while testing:**
+  - an overlay helper's `VR_Init` starts SteamVR if it isn't running. The helper now checks
+    with a background init first. The broken build's first test run left a stray
+    `vrmonitor.exe` showing "Unexpected SteamVR Error".
+  - SteamVR running without a connected headset refuses the overlay app with
+    `WirelessHmdNotConnected` after about 4 s.
+- **Not yet run against real OpenVR:** the helper's running path (SteamVR on, headset on).
+  That's the first item of the next headset session.
+
 ## Planned mod (unchanged by the probe's outcome, except where gaze comes from)
 
 - A proxy `openvr_api.dll`, one copy in each program's DLL folder (above), forwarding every
