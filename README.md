@@ -59,5 +59,9 @@ Start SteamVR with the Frame first, then Rez. Logs: `REZ\rez_gaze.log` (the DLL)
 3. **`mode=gaze`.** The cursor follows the eyes. Play an area.
 4. **`source=helper`, then `source=osc`.** Compare how they feel. The 5 s log lines show each
    source's age.
+5. **Display-rate cursor.** This comes from the frame-rate mod (branch `hfr`, `c91cc6f`).
+   Toggle `cursor=0` / `cursor=1` in `REZ\rez_hfr.ini` (re-read every 2 s): first with
+   `mode=head`, then with gaze. With `cursor=1` the cursor should move at display rate instead
+   of stepping at 60 Hz, and lock-on should behave the same.
 
 The frame-rate mod (branch `hfr`) also uses Rez's folder. Tell that session before launching.
