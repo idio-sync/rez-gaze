@@ -25,11 +25,16 @@ private:
     double legacy_report_ms_ = -1e9;
 };
 
+// OSC route: listens for vrlink's OSC eye data on 127.0.0.1:port.
+int RunOscProbe(int port, double seconds, Recorder& rec);
+
 // OpenXR route: XR_EXT_eye_gaze_interaction in an XR_MND_headless session (no graphics, no
-// frame loop), so it can run beside a game.
+// frame loop), so it can run beside a game; or, with frames, a D3D11 session that submits
+// a cleared frame each refresh (SteamVR turned the headless session into a scene app anyway,
+// and gave it no gaze).
 class OpenXrSession {
 public:
-    bool Init(Recorder& rec);
+    bool Init(Recorder& rec, bool frames = false);
     void Poll(Recorder& rec);
     void Shutdown();
     ~OpenXrSession() { Shutdown(); }

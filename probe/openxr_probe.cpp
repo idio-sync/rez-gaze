@@ -5,8 +5,11 @@
 
 #include <windows.h>
 #include <unknwn.h>  // openxr_platform.h's Win32 section names IUnknown
+#include <d3d11.h>
+#include <dxgi.h>
 
 #define XR_USE_PLATFORM_WIN32
+#define XR_USE_GRAPHICS_API_D3D11
 #define XR_NO_PROTOTYPES
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
@@ -39,6 +42,19 @@ namespace {
     X(xrGetActionStatePose)                        \
     X(xrGetCurrentInteractionProfile)              \
     X(xrLocateSpace)                               \
+    X(xrEnumerateViewConfigurationViews)           \
+    X(xrEnumerateSwapchainFormats)                 \
+    X(xrCreateSwapchain)                           \
+    X(xrDestroySwapchain)                          \
+    X(xrEnumerateSwapchainImages)                  \
+    X(xrAcquireSwapchainImage)                     \
+    X(xrWaitSwapchainImage)                        \
+    X(xrReleaseSwapchainImage)                     \
+    X(xrLocateViews)                               \
+    X(xrWaitFrame)                                 \
+    X(xrBeginFrame)                                \
+    X(xrEndFrame)                                  \
+    X(xrGetD3D11GraphicsRequirementsKHR)           \
     X(xrConvertWin32PerformanceCounterToTimeKHR)
 
 const char* StateName(XrSessionState s) {
@@ -84,6 +100,17 @@ struct OpenXrSession::Impl {
     XrSessionState state = XR_SESSION_STATE_UNKNOWN;
     bool running = false;
 
+    // --frames: a normal D3D11 session with a frame loop. Each eye is cleared to dim green
+    // while gaze is tracked and dim red while it isn't, so the result shows in the headset.
+    bool frames = false;
+    ID3D11Device* device = nullptr;
+    ID3D11DeviceContext* context = nullptr;
+    XrSpace local = XR_NULL_HANDLE;
+    XrSwapchain swapchain[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
+    std::vector<ID3D11RenderTargetView*> rtvs[2];
+    int32_t width = 0, height = 0;
+    bool last_tracked = false;
+
     std::string Str(XrResult r) {
         char buf[XR_MAX_RESULT_STRING_SIZE] = {};
         if (xrResultToString && instance) xrResultToString(instance, r, buf);
@@ -111,11 +138,93 @@ struct OpenXrSession::Impl {
         }
         rec.Note("interaction profile for /user/eyes_ext: " + name + " (" + Str(r) + ")");
     }
+
+    bool CreateDevice(Recorder& rec) {
+        XrGraphicsRequirementsD3D11KHR req{XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
+        XrResult r = xrGetD3D11GraphicsRequirementsKHR(instance, system, &req);
+        if (XR_FAILED(r)) {
+            rec.Note("xrGetD3D11GraphicsRequirementsKHR failed: " + Str(r));
+            return false;
+        }
+        IDXGIFactory1* factory = nullptr;
+        CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void**>(&factory));
+        IDXGIAdapter1* adapter = nullptr;
+        for (UINT i = 0; factory && factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
+            DXGI_ADAPTER_DESC1 d;
+            adapter->GetDesc1(&d);
+            if (std::memcmp(&d.AdapterLuid, &req.adapterLuid, sizeof d.AdapterLuid) == 0) break;
+            adapter->Release();
+            adapter = nullptr;
+        }
+        if (factory) factory->Release();
+        HRESULT hr = D3D11CreateDevice(adapter, adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE,
+                                       nullptr, 0, nullptr, 0, D3D11_SDK_VERSION, &device, nullptr, &context);
+        if (adapter) adapter->Release();
+        if (FAILED(hr)) {
+            rec.Note("D3D11CreateDevice failed: " + std::to_string(hr));
+            return false;
+        }
+        return true;
+    }
+
+    bool CreateSwapchains(Recorder& rec) {
+        uint32_t n = 0;
+        xrEnumerateViewConfigurationViews(instance, system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &n, nullptr);
+        std::vector<XrViewConfigurationView> views(n, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+        xrEnumerateViewConfigurationViews(instance, system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, n, &n, views.data());
+        if (n < 2) return false;
+        // Nothing is drawn but a clear, so a quarter of the recommended size is plenty.
+        width = static_cast<int32_t>(views[0].recommendedImageRectWidth / 4);
+        height = static_cast<int32_t>(views[0].recommendedImageRectHeight / 4);
+
+        xrEnumerateSwapchainFormats(session, 0, &n, nullptr);
+        std::vector<int64_t> formats(n);
+        xrEnumerateSwapchainFormats(session, n, &n, formats.data());
+        int64_t format = formats.empty() ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : formats[0];
+        for (int64_t f : formats) {
+            if (f == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || f == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+                format = f;
+                break;
+            }
+        }
+        for (int eye = 0; eye < 2; ++eye) {
+            XrSwapchainCreateInfo ci{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+            ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+            ci.format = format;
+            ci.sampleCount = 1;
+            ci.width = width;
+            ci.height = height;
+            ci.faceCount = 1;
+            ci.arraySize = 1;
+            ci.mipCount = 1;
+            XrResult r = xrCreateSwapchain(session, &ci, &swapchain[eye]);
+            if (XR_FAILED(r)) {
+                rec.Note("xrCreateSwapchain failed: " + Str(r));
+                return false;
+            }
+            xrEnumerateSwapchainImages(swapchain[eye], 0, &n, nullptr);
+            std::vector<XrSwapchainImageD3D11KHR> images(n, {XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR});
+            xrEnumerateSwapchainImages(swapchain[eye], n, &n,
+                                       reinterpret_cast<XrSwapchainImageBaseHeader*>(images.data()));
+            for (auto& img : images) {
+                D3D11_RENDER_TARGET_VIEW_DESC rd{};
+                rd.Format = static_cast<DXGI_FORMAT>(format);
+                rd.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+                ID3D11RenderTargetView* rtv = nullptr;
+                device->CreateRenderTargetView(img.texture, &rd, &rtv);
+                rtvs[eye].push_back(rtv);
+            }
+        }
+        rec.Note("swapchains " + std::to_string(width) + "x" + std::to_string(height) + ", format " +
+                 std::to_string(format));
+        return true;
+    }
 };
 
-bool OpenXrSession::Init(Recorder& rec) {
+bool OpenXrSession::Init(Recorder& rec, bool frames) {
     impl_ = new Impl;
     Impl& x = *impl_;
+    x.frames = frames;
     x.loader = LoadLibraryW(L"openxr_loader.dll");
     if (!x.loader) {
         x.loader = LoadLibraryW(
@@ -144,7 +253,8 @@ bool OpenXrSession::Init(Recorder& rec) {
         for (auto& e : exts) if (std::strcmp(e.extensionName, name) == 0) return true;
         return false;
     };
-    const char* want[] = {XR_MND_HEADLESS_EXTENSION_NAME, XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME,
+    const char* want[] = {frames ? XR_KHR_D3D11_ENABLE_EXTENSION_NAME : XR_MND_HEADLESS_EXTENSION_NAME,
+                          XR_EXT_EYE_GAZE_INTERACTION_EXTENSION_NAME,
                           XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME};
     for (const char* w : want) {
         rec.Note(std::string("extension ") + w + (has(w) ? ": offered" : ": NOT offered"));
@@ -212,14 +322,21 @@ bool OpenXrSession::Init(Recorder& rec) {
         return false;
     }
 
-    // XR_MND_headless: no graphics binding in the chain.
+    // Headless: no graphics binding in the chain. --frames: a D3D11 binding.
     XrSessionCreateInfo sci{XR_TYPE_SESSION_CREATE_INFO};
     sci.systemId = x.system;
+    XrGraphicsBindingD3D11KHR gb{XR_TYPE_GRAPHICS_BINDING_D3D11_KHR};
+    if (frames) {
+        if (!x.CreateDevice(rec)) return false;
+        gb.device = x.device;
+        sci.next = &gb;
+    }
     r = x.xrCreateSession(x.instance, &sci, &x.session);
     if (XR_FAILED(r)) {
-        rec.Note("headless xrCreateSession failed: " + x.Str(r));
+        rec.Note(std::string(frames ? "D3D11" : "headless") + " xrCreateSession failed: " + x.Str(r));
         return false;
     }
+    if (frames && !x.CreateSwapchains(rec)) return false;
     XrSessionActionSetsAttachInfo ai{XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO};
     ai.countActionSets = 1;
     ai.actionSets = &x.set;
@@ -233,7 +350,9 @@ bool OpenXrSession::Init(Recorder& rec) {
     rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
     rsci.poseInReferenceSpace.orientation.w = 1;
     x.xrCreateReferenceSpace(x.session, &rsci, &x.view);
-    rec.Note("headless session created; waiting for READY");
+    rsci.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    x.xrCreateReferenceSpace(x.session, &rsci, &x.local);
+    rec.Note(std::string(frames ? "D3D11" : "headless") + " session created; waiting for READY");
     return true;
 }
 
@@ -265,7 +384,19 @@ void OpenXrSession::Poll(Recorder& rec) {
         }
         ev = {XR_TYPE_EVENT_DATA_BUFFER};
     }
-    if (!x.running) return;
+    if (!x.running) {
+        if (x.frames) Sleep(5);  // main doesn't sleep in --frames mode
+        return;
+    }
+
+    XrFrameState fs{XR_TYPE_FRAME_STATE};
+    if (x.frames) {
+        XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
+        x.xrWaitFrame(x.session, &wi, &fs);
+        XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
+        x.xrBeginFrame(x.session, &bi);
+    }
+    XrTime when = x.frames ? fs.predictedDisplayTime : x.Now();
 
     XrActiveActionSet active{x.set, XR_NULL_PATH};
     XrActionsSyncInfo si{XR_TYPE_ACTIONS_SYNC_INFO};
@@ -279,7 +410,7 @@ void OpenXrSession::Poll(Recorder& rec) {
     x.xrGetActionStatePose(x.session, &gi, &ps);
 
     XrSpaceLocation loc{XR_TYPE_SPACE_LOCATION};
-    XrResult lr = x.xrLocateSpace(x.gaze, x.view, x.Now(), &loc);
+    XrResult lr = x.xrLocateSpace(x.gaze, x.view, when, &loc);
 
     Sample s;
     s.result = std::string(StateName(x.state)) + ":" + x.Str(sr);
@@ -293,15 +424,71 @@ void OpenXrSession::Poll(Recorder& rec) {
         s.origin_head = {loc.pose.position.x, loc.pose.position.y, loc.pose.position.z};
     }
     rec.Add(s);
+    if (!x.frames) return;
+
+    if (s.tracked != x.last_tracked) {
+        rec.Note(s.tracked ? "headset now GREEN (gaze tracked)" : "headset now RED (no gaze)");
+        x.last_tracked = s.tracked;
+    }
+    XrCompositionLayerProjectionView pv[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                              {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+    XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    const XrCompositionLayerBaseHeader* layers[] = {
+        reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
+    uint32_t layer_count = 0;
+    if (fs.shouldRender) {
+        XrViewLocateInfo vli{XR_TYPE_VIEW_LOCATE_INFO};
+        vli.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+        vli.displayTime = fs.predictedDisplayTime;
+        vli.space = x.local;
+        XrViewState vs{XR_TYPE_VIEW_STATE};
+        XrView views[2] = {{XR_TYPE_VIEW}, {XR_TYPE_VIEW}};
+        uint32_t nv = 0;
+        x.xrLocateViews(x.session, &vli, &vs, 2, &nv, views);
+        const float green[4] = {0.0f, 0.18f, 0.0f, 1.0f};
+        const float red[4] = {0.18f, 0.0f, 0.0f, 1.0f};
+        for (int eye = 0; eye < 2; ++eye) {
+            uint32_t idx = 0;
+            XrSwapchainImageAcquireInfo ai{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+            x.xrAcquireSwapchainImage(x.swapchain[eye], &ai, &idx);
+            XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+            wi.timeout = XR_INFINITE_DURATION;
+            x.xrWaitSwapchainImage(x.swapchain[eye], &wi);
+            x.context->ClearRenderTargetView(x.rtvs[eye][idx], s.tracked ? green : red);
+            XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+            x.xrReleaseSwapchainImage(x.swapchain[eye], &ri);
+            pv[eye].pose = views[eye].pose;
+            pv[eye].fov = views[eye].fov;
+            pv[eye].subImage.swapchain = x.swapchain[eye];
+            pv[eye].subImage.imageRect = {{0, 0}, {x.width, x.height}};
+        }
+        layer.space = x.local;
+        layer.viewCount = 2;
+        layer.views = pv;
+        layer_count = 1;
+    }
+    XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
+    ei.displayTime = fs.predictedDisplayTime;
+    ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    ei.layerCount = layer_count;
+    ei.layers = layers;
+    XrResult er = x.xrEndFrame(x.session, &ei);
+    if (XR_FAILED(er)) rec.Note("xrEndFrame: " + x.Str(er));
 }
 
 void OpenXrSession::Shutdown() {
     if (!impl_) return;
     Impl& x = *impl_;
+    for (int eye = 0; eye < 2; ++eye) {
+        for (auto* rtv : x.rtvs[eye]) if (rtv) rtv->Release();
+        if (x.swapchain[eye]) x.xrDestroySwapchain(x.swapchain[eye]);
+    }
     if (x.session) {
         if (x.running) x.xrEndSession(x.session);
         x.xrDestroySession(x.session);
     }
+    if (x.context) x.context->Release();
+    if (x.device) x.device->Release();
     if (x.instance) x.xrDestroyInstance(x.instance);
     if (x.loader) FreeLibrary(x.loader);
     delete impl_;

@@ -26,14 +26,20 @@ void Usage() {
         "  openxr   XR_EXT_eye_gaze_interaction in an XR_MND_headless session, beside the game.\n"
         "  inproc   Stand-in for a mod inside the game: registers as the scene app (OpenVR),\n"
         "           then reads gaze both ways from this one process. Run with NO game open.\n"
+        "  osc      Listens for Steam Link's OSC eye data (SteamVR > Settings > Steam Link:\n"
+        "           Enable OSC + Share eye tracking data to other apps on this PC).\n"
         "\n"
         "options:\n"
         "  --app overlay|background|scene   OpenVR app type for openvr mode (default overlay)\n"
         "  --bind PATH       OpenVR binding path (default /user/head/eyetracking)\n"
         "  --seconds N       stop after N seconds (default: run until Ctrl+C)\n"
         "  --hz N            polls per second (default 250)\n"
+        "  --port N          in osc: UDP port (default 9000; Steam Link's alternative is 9015)\n"
         "  --legacy-check    in openvr/inproc: also watch the old GetControllerState API, to see\n"
         "                    whether setting an action manifest switches it off\n"
+        "  --frames          in openxr: a D3D11 session that submits frames (the headset shows\n"
+        "                    dim green while gaze is tracked, dim red while not) instead of a\n"
+        "                    headless one; polls once per display refresh\n"
         "\n"
         "Logs go to logs\\gaze-<mode>-<time>.csv beside the exe.\n");
 }
@@ -49,6 +55,8 @@ int main(int argc, char** argv) {
     OpenVrOptions vro;
     double seconds = 0;
     int hz = 250;
+    int port = 9000;
+    bool frames = false;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -57,6 +65,8 @@ int main(int argc, char** argv) {
         else if (a == "--seconds") seconds = std::atof(next().c_str());
         else if (a == "--hz") hz = std::atoi(next().c_str());
         else if (a == "--legacy-check") vro.legacy_check = true;
+        else if (a == "--frames") frames = true;
+        else if (a == "--port") port = std::atoi(next().c_str());
         else {
             std::printf("unknown option %s\n\n", a.c_str());
             Usage();
@@ -80,14 +90,18 @@ int main(int argc, char** argv) {
         vr.Shutdown();
         rec.Summary();
     } else if (mode == "openxr") {
-        Recorder rec("openxr");
+        Recorder rec(frames ? "openxr-frames" : "openxr");
         OpenXrSession xr;
-        if (!xr.Init(rec)) return 1;
+        if (!xr.Init(rec, frames)) return 1;
         while (!g_stop && (seconds <= 0 || rec.NowMs() < seconds * 1000)) {
             xr.Poll(rec);
-            Sleep(sleep_ms);
+            if (!frames) Sleep(sleep_ms);  // xrWaitFrame paces --frames
         }
         xr.Shutdown();
+        rec.Summary();
+    } else if (mode == "osc") {
+        Recorder rec("osc");
+        rc = RunOscProbe(port, seconds, rec);
         rec.Summary();
     } else if (mode == "inproc") {
         vro.app = "scene";
