@@ -9,7 +9,8 @@ add_executable(gaze_probe
     probe/recorder.cpp
     probe/openvr_probe.cpp
     probe/openxr_probe.cpp
-    probe/osc_probe.cpp)
+    probe/osc_probe.cpp
+    probe/osc_replay.cpp)
 target_include_directories(gaze_probe PRIVATE
     third_party/openvr/headers
     third_party/openxr/include)

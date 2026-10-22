@@ -28,6 +28,9 @@ void Usage() {
         "           then reads gaze both ways from this one process. Run with NO game open.\n"
         "  osc      Listens for Steam Link's OSC eye data (SteamVR > Settings > Steam Link:\n"
         "           Enable OSC + Share eye tracking data to other apps on this PC).\n"
+        "  replay   Sends gaze over OSC the way Steam Link does, for testing without the\n"
+        "           headset: --csv <probe csv> replays a recording (looping if --seconds),\n"
+        "           otherwise a circle of --circle degrees (default 15), one turn per 4 s.\n"
         "\n"
         "options:\n"
         "  --app overlay|background|scene   OpenVR app type for openvr mode (default overlay)\n"
@@ -57,6 +60,8 @@ int main(int argc, char** argv) {
     int hz = 250;
     int port = 9000;
     bool frames = false;
+    std::string csv;
+    double circle = 15;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -67,6 +72,8 @@ int main(int argc, char** argv) {
         else if (a == "--legacy-check") vro.legacy_check = true;
         else if (a == "--frames") frames = true;
         else if (a == "--port") port = std::atoi(next().c_str());
+        else if (a == "--csv") csv = next();
+        else if (a == "--circle") circle = std::atof(next().c_str());
         else {
             std::printf("unknown option %s\n\n", a.c_str());
             Usage();
@@ -102,6 +109,10 @@ int main(int argc, char** argv) {
     } else if (mode == "osc") {
         Recorder rec("osc");
         rc = RunOscProbe(port, seconds, rec);
+        rec.Summary();
+    } else if (mode == "replay") {
+        Recorder rec("replay");
+        rc = RunOscReplay(csv, circle, port, seconds, hz == 250 ? 60 : hz, rec);
         rec.Summary();
     } else if (mode == "inproc") {
         vro.app = "scene";

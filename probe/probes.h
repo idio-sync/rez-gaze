@@ -27,6 +27,8 @@ private:
 
 // OSC route: listens for vrlink's OSC eye data on 127.0.0.1:port.
 int RunOscProbe(int port, double seconds, Recorder& rec);
+// replay mode: sends gaze over OSC as vrlink does, from a probe CSV or as a circle.
+int RunOscReplay(const std::string& csv, double circle_deg, int port, double seconds, int hz, Recorder& rec);
 
 // OpenXR route: XR_EXT_eye_gaze_interaction in an XR_MND_headless session (no graphics, no
 // frame loop), so it can run beside a game; or, with frames, a D3D11 session that submits
