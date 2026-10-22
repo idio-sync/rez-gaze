@@ -27,6 +27,8 @@ private:
 
 // OSC route: listens for vrlink's OSC eye data on 127.0.0.1:port.
 int RunOscProbe(int port, double seconds, Recorder& rec);
+// shm mode: prints the helper's shared-memory block for a game pid once a second.
+int RunShmProbe(unsigned long pid, double seconds, Recorder& rec);
 // replay mode: sends gaze over OSC as vrlink does, from a probe CSV or as a circle.
 int RunOscReplay(const std::string& csv, double circle_deg, int port, double seconds, int hz, Recorder& rec);
 
