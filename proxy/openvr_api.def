@@ -1,0 +1,5 @@
+; Stand-in for REZ\openvr_api.dll. VR_GetGenericInterface is ours; the rest are forwarded to the
+; game's own DLL (renamed openvr_api_real.dll) by /export directives in forwards.cpp.
+LIBRARY openvr_api
+EXPORTS
+    VR_GetGenericInterface

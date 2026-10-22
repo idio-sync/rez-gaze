@@ -1,0 +1,12 @@
+// Forwards every export but VR_GetGenericInterface to the game's own DLL, renamed
+// openvr_api_real.dll. (Forwarders in the .def file failed to link with MSVC 14.50.)
+#pragma comment(linker, "/export:VR_GetInitToken=openvr_api_real.VR_GetInitToken")
+#pragma comment(linker, "/export:VR_GetStringForHmdError=openvr_api_real.VR_GetStringForHmdError")
+#pragma comment(linker, "/export:VR_GetVRInitErrorAsEnglishDescription=openvr_api_real.VR_GetVRInitErrorAsEnglishDescription")
+#pragma comment(linker, "/export:VR_GetVRInitErrorAsSymbol=openvr_api_real.VR_GetVRInitErrorAsSymbol")
+#pragma comment(linker, "/export:VR_InitInternal=openvr_api_real.VR_InitInternal")
+#pragma comment(linker, "/export:VR_IsHmdPresent=openvr_api_real.VR_IsHmdPresent")
+#pragma comment(linker, "/export:VR_IsInterfaceVersionValid=openvr_api_real.VR_IsInterfaceVersionValid")
+#pragma comment(linker, "/export:VR_IsRuntimeInstalled=openvr_api_real.VR_IsRuntimeInstalled")
+#pragma comment(linker, "/export:VR_RuntimePath=openvr_api_real.VR_RuntimePath")
+#pragma comment(linker, "/export:VR_ShutdownInternal=openvr_api_real.VR_ShutdownInternal")

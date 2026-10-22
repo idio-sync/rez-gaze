@@ -1,0 +1,449 @@
+// Spike: a stand-in openvr_api.dll for REZ.exe that aims the controller with the eyes.
+//
+// REZ.exe asks for IVRSystem_015 (SDK 1.0.5 layout) and IVRCompositor_015 (SDK 1.0.1 layout).
+// We patch the pose-returning slots of those vtables in place and rewrite the aiming
+// controller's pose before the game sees it. Gaze comes from Steam Link's OSC stream
+// (/tracking/eye/CenterVecFull on 127.0.0.1:9000), read on a thread in this DLL.
+//
+// rez_gaze.ini beside the DLL, reread every second:
+//   [rez_gaze]
+//   mode=log|head|gaze     log: record calls only; head: controller points where the head
+//                          points; gaze: controller points from the hand at the gazed point
+//   hand=right|left|both   which controller(s) to rewrite
+//   distance=30            metres to the gazed point (gaze mode)
+//   pitch=0, yaw=0         degrees, rotate the result in the controller's own frame
+//   smooth_ms=0            exponential smoothing of the gaze direction
+//   port=9000              OSC port (read at start only)
+// Log: rez_gaze.log beside the DLL.
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#include <openvr.h>
+
+#include <atomic>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
+#include <thread>
+
+namespace {
+
+// ---- config and log ------------------------------------------------------------------------
+
+std::wstring g_dir;  // folder of this DLL, with trailing backslash
+FILE* g_log = nullptr;
+std::mutex g_log_mutex;
+
+void Log(const char* fmt, ...) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    if (!g_log) return;
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    std::fprintf(g_log, "%02d:%02d:%02d.%03d ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(g_log, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', g_log);
+    std::fflush(g_log);
+}
+
+enum class Mode { Log, Head, Gaze };
+
+struct Config {
+    Mode mode = Mode::Log;
+    bool right = true, left = true;
+    double distance = 30, pitch = 0, yaw = 0, smooth_ms = 0;
+    int port = 9000;
+};
+
+Config g_cfg;
+std::mutex g_cfg_mutex;
+
+Config ReadConfig() {
+    std::wstring ini = g_dir + L"rez_gaze.ini";
+    wchar_t buf[64];
+    Config c;
+    GetPrivateProfileStringW(L"rez_gaze", L"mode", L"log", buf, 64, ini.c_str());
+    c.mode = _wcsicmp(buf, L"head") == 0 ? Mode::Head : _wcsicmp(buf, L"gaze") == 0 ? Mode::Gaze : Mode::Log;
+    GetPrivateProfileStringW(L"rez_gaze", L"hand", L"both", buf, 64, ini.c_str());
+    c.right = _wcsicmp(buf, L"left") != 0;
+    c.left = _wcsicmp(buf, L"right") != 0;
+    auto num = [&](const wchar_t* key, double def) {
+        wchar_t b[64];
+        GetPrivateProfileStringW(L"rez_gaze", key, L"", b, 64, ini.c_str());
+        return b[0] ? _wtof(b) : def;
+    };
+    c.distance = num(L"distance", 30);
+    c.pitch = num(L"pitch", 0);
+    c.yaw = num(L"yaw", 0);
+    c.smooth_ms = num(L"smooth_ms", 0);
+    c.port = static_cast<int>(num(L"port", 9000));
+    return c;
+}
+
+const char* ModeName(Mode m) { return m == Mode::Head ? "head" : m == Mode::Gaze ? "gaze" : "log"; }
+
+// ---- gaze from OSC -------------------------------------------------------------------------
+
+struct V3 {
+    double x = 0, y = 0, z = 0;
+};
+V3 operator+(V3 a, V3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
+V3 operator-(V3 a, V3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
+V3 operator*(V3 a, double s) { return {a.x * s, a.y * s, a.z * s}; }
+double Dot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+V3 Cross(V3 a, V3 b) { return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x}; }
+V3 Norm(V3 a) {
+    double l = std::sqrt(Dot(a, a));
+    return l > 1e-9 ? a * (1 / l) : V3{0, 0, -1};
+}
+
+std::mutex g_gaze_mutex;
+V3 g_gaze{0, 0, -1};          // head space, -Z forward
+LONGLONG g_gaze_qpc = 0;      // when it arrived
+std::atomic<long> g_gaze_packets{0};
+LONGLONG g_qpf = 1;
+
+LONGLONG Qpc() {
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return c.QuadPart;
+}
+
+float BeFloat(const unsigned char* p) {
+    uint32_t u = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+// Finds /tracking/eye/CenterVecFull ,fff in a packet (plain message or bundle).
+void HandlePacket(const unsigned char* p, size_t n) {
+    if (n >= 16 && std::memcmp(p, "#bundle", 8) == 0) {
+        size_t off = 16;
+        while (off + 4 <= n) {
+            uint32_t len = (uint32_t(p[off]) << 24) | (uint32_t(p[off + 1]) << 16) |
+                           (uint32_t(p[off + 2]) << 8) | p[off + 3];
+            off += 4;
+            if (off + len > n) return;
+            HandlePacket(p + off, len);
+            off += len;
+        }
+        return;
+    }
+    static const char kAddr[] = "/tracking/eye/CenterVecFull";  // 27 chars, padded to 28
+    if (n < 28 + 8 + 12 || std::memcmp(p, kAddr, sizeof kAddr) != 0) return;
+    if (std::memcmp(p + 28, ",fff", 4) != 0) return;
+    const unsigned char* a = p + 28 + 8;
+    // VRChat's convention is +Z forward.
+    V3 g = Norm({BeFloat(a), BeFloat(a + 4), -BeFloat(a + 8)});
+    std::lock_guard<std::mutex> lock(g_gaze_mutex);
+    g_gaze = g;
+    g_gaze_qpc = Qpc();
+    ++g_gaze_packets;
+}
+
+void OscThread(int port) {
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<u_short>(port));
+    inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
+    if (bind(s, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0) {
+        Log("OSC: can't bind 127.0.0.1:%d (error %d); gaze mode falls back to head", port, WSAGetLastError());
+        return;
+    }
+    Log("OSC: listening on 127.0.0.1:%d", port);
+    unsigned char buf[4096];
+    for (;;) {
+        int n = recv(s, reinterpret_cast<char*>(buf), sizeof buf, 0);
+        if (n > 0) HandlePacket(buf, static_cast<size_t>(n));
+    }
+}
+
+// ---- pose rewriting ------------------------------------------------------------------------
+
+vr::IVRSystem* g_system = nullptr;  // the game's IVRSystem_015 object
+
+using FnRoleToIndex = vr::TrackedDeviceIndex_t(__fastcall*)(void*, vr::ETrackedControllerRole);
+FnRoleToIndex g_orig_role_to_index = nullptr;
+
+vr::TrackedDeviceIndex_t g_right = vr::k_unTrackedDeviceIndexInvalid;
+vr::TrackedDeviceIndex_t g_left = vr::k_unTrackedDeviceIndexInvalid;
+V3 g_smoothed{0, 0, -1};
+LONGLONG g_smoothed_qpc = 0;
+
+void RefreshEverySecond() {
+    static LONGLONG last = 0;
+    LONGLONG now = Qpc();
+    if (now - last < g_qpf) return;
+    last = now;
+    Config c = ReadConfig();
+    {
+        std::lock_guard<std::mutex> lock(g_cfg_mutex);
+        if (c.mode != g_cfg.mode) Log("mode %s -> %s", ModeName(g_cfg.mode), ModeName(c.mode));
+        g_cfg = c;
+    }
+    if (g_system && g_orig_role_to_index) {
+        auto r = g_orig_role_to_index(g_system, vr::TrackedControllerRole_RightHand);
+        auto l = g_orig_role_to_index(g_system, vr::TrackedControllerRole_LeftHand);
+        if (r != g_right || l != g_left) Log("hands: right=%d left=%d", (int)r, (int)l);
+        g_right = r;
+        g_left = l;
+    }
+}
+
+V3 Col(const vr::HmdMatrix34_t& m, int c) { return {m.m[0][c], m.m[1][c], m.m[2][c]}; }
+V3 Pos(const vr::HmdMatrix34_t& m) { return {m.m[0][3], m.m[1][3], m.m[2][3]}; }
+void SetCol(vr::HmdMatrix34_t& m, int c, V3 v) {
+    m.m[0][c] = (float)v.x;
+    m.m[1][c] = (float)v.y;
+    m.m[2][c] = (float)v.z;
+}
+
+// Gaze direction in world space, smoothed; head forward when no recent OSC.
+V3 WorldGaze(const vr::HmdMatrix34_t& head, const Config& c) {
+    V3 g;
+    LONGLONG at;
+    {
+        std::lock_guard<std::mutex> lock(g_gaze_mutex);
+        g = g_gaze;
+        at = g_gaze_qpc;
+    }
+    LONGLONG now = Qpc();
+    if (at == 0 || now - at > g_qpf / 4) g = {0, 0, -1};
+    V3 w = Norm(Col(head, 0) * g.x + Col(head, 1) * g.y + Col(head, 2) * g.z);
+    if (c.smooth_ms > 0 && g_smoothed_qpc) {
+        double dt_ms = (now - g_smoothed_qpc) * 1000.0 / g_qpf;
+        double k = 1 - std::exp(-dt_ms / c.smooth_ms);
+        w = Norm(g_smoothed + (w - g_smoothed) * k);
+    }
+    g_smoothed = w;
+    g_smoothed_qpc = now;
+    return w;
+}
+
+// Rotation whose -Z points along f, roll taken from the head's up, then pitch/yaw in its frame.
+void Aim(vr::HmdMatrix34_t& m, V3 f, V3 up, const Config& c) {
+    V3 z = f * -1;
+    V3 x = Norm(Cross(up, z));
+    V3 y = Cross(z, x);
+    double p = c.pitch * 3.14159265358979 / 180, w = c.yaw * 3.14159265358979 / 180;
+    // yaw about local y, then pitch about local x
+    V3 x1 = x * std::cos(w) - z * std::sin(w), z1 = x * std::sin(w) + z * std::cos(w);
+    V3 y2 = y * std::cos(p) + z1 * std::sin(p), z2 = z1 * std::cos(p) - y * std::sin(p);
+    SetCol(m, 0, x1);
+    SetCol(m, 1, y2);
+    SetCol(m, 2, z2);
+}
+
+std::atomic<long> g_rewrites{0};
+
+void Rewrite(vr::TrackedDevicePose_t* poses, uint32_t n) {
+    if (!poses || n == 0) return;
+    Config c;
+    {
+        std::lock_guard<std::mutex> lock(g_cfg_mutex);
+        c = g_cfg;
+    }
+    if (c.mode == Mode::Log || !poses[0].bPoseIsValid) return;
+    const vr::HmdMatrix34_t& head = poses[0].mDeviceToAbsoluteTracking;
+    V3 head_pos = Pos(head);
+    V3 dir = c.mode == Mode::Gaze ? WorldGaze(head, c) : Norm(Col(head, 2) * -1);
+    for (vr::TrackedDeviceIndex_t i : {c.right ? g_right : vr::k_unTrackedDeviceIndexInvalid,
+                                       c.left ? g_left : vr::k_unTrackedDeviceIndexInvalid}) {
+        if (i == vr::k_unTrackedDeviceIndexInvalid || i >= n || !poses[i].bPoseIsValid) continue;
+        vr::HmdMatrix34_t& m = poses[i].mDeviceToAbsoluteTracking;
+        V3 f = c.mode == Mode::Gaze ? Norm(head_pos + dir * c.distance - Pos(m)) : dir;
+        Aim(m, f, Col(head, 1), c);
+        ++g_rewrites;
+    }
+}
+
+// ---- hooks ---------------------------------------------------------------------------------
+
+struct Counter {
+    const char* name;
+    std::atomic<long> n{0};
+};
+Counter g_count_wait{"WaitGetPoses"}, g_count_last{"GetLastPoses"}, g_count_last_one{"GetLastPoseForTrackedDeviceIndex"},
+    g_count_abs{"GetDeviceToAbsoluteTrackingPose"}, g_count_state{"GetControllerState"},
+    g_count_state_pose{"GetControllerStateWithPose"}, g_count_role{"GetTrackedDeviceIndexForControllerRole"},
+    g_count_event_pose{"PollNextEventWithPose"};
+Counter* g_counters[] = {&g_count_wait, &g_count_last, &g_count_last_one, &g_count_abs,
+                         &g_count_state, &g_count_state_pose, &g_count_role, &g_count_event_pose};
+
+void ReportEveryFiveSeconds() {
+    static LONGLONG last = 0;
+    LONGLONG now = Qpc();
+    if (last == 0) last = now;
+    if (now - last < 5 * g_qpf) return;
+    last = now;
+    std::string s;
+    for (Counter* c : g_counters) {
+        long v = c->n.exchange(0);
+        if (v) s += std::string(" ") + c->name + "=" + std::to_string(v);
+    }
+    LONGLONG at;
+    V3 g;
+    {
+        std::lock_guard<std::mutex> lock(g_gaze_mutex);
+        at = g_gaze_qpc;
+        g = g_gaze;
+    }
+    Log("5 s:%s | rewrites=%ld | osc packets=%ld, last %.0f ms ago, gaze %.3f %.3f %.3f", s.c_str(),
+        g_rewrites.exchange(0), g_gaze_packets.exchange(0), at ? (now - at) * 1000.0 / g_qpf : -1.0, g.x,
+        g.y, g.z);
+}
+
+void Tick() {
+    RefreshEverySecond();
+    ReportEveryFiveSeconds();
+}
+
+using FnPoses = vr::EVRCompositorError(__fastcall*)(void*, vr::TrackedDevicePose_t*, uint32_t, vr::TrackedDevicePose_t*, uint32_t);
+using FnLastOne = vr::EVRCompositorError(__fastcall*)(void*, vr::TrackedDeviceIndex_t, vr::TrackedDevicePose_t*, vr::TrackedDevicePose_t*);
+using FnAbs = void(__fastcall*)(void*, vr::ETrackingUniverseOrigin, float, vr::TrackedDevicePose_t*, uint32_t);
+using FnState = bool(__fastcall*)(void*, vr::TrackedDeviceIndex_t, void*, uint32_t);
+using FnStatePose = bool(__fastcall*)(void*, vr::ETrackingUniverseOrigin, vr::TrackedDeviceIndex_t, void*, uint32_t, vr::TrackedDevicePose_t*);
+using FnEventPose = bool(__fastcall*)(void*, vr::ETrackingUniverseOrigin, void*, uint32_t, vr::TrackedDevicePose_t*);
+
+FnPoses g_orig_wait = nullptr, g_orig_last = nullptr;
+FnLastOne g_orig_last_one = nullptr;
+FnAbs g_orig_abs = nullptr;
+FnState g_orig_state = nullptr;
+FnStatePose g_orig_state_pose = nullptr;
+FnEventPose g_orig_event_pose = nullptr;
+
+vr::EVRCompositorError __fastcall HookWait(void* self, vr::TrackedDevicePose_t* r, uint32_t rn, vr::TrackedDevicePose_t* g, uint32_t gn) {
+    auto e = g_orig_wait(self, r, rn, g, gn);
+    ++g_count_wait.n;
+    Tick();
+    Rewrite(r, rn);
+    Rewrite(g, gn);
+    return e;
+}
+
+vr::EVRCompositorError __fastcall HookLast(void* self, vr::TrackedDevicePose_t* r, uint32_t rn, vr::TrackedDevicePose_t* g, uint32_t gn) {
+    auto e = g_orig_last(self, r, rn, g, gn);
+    ++g_count_last.n;
+    Rewrite(r, rn);
+    Rewrite(g, gn);
+    return e;
+}
+
+vr::EVRCompositorError __fastcall HookLastOne(void* self, vr::TrackedDeviceIndex_t i, vr::TrackedDevicePose_t* p, vr::TrackedDevicePose_t* gp) {
+    ++g_count_last_one.n;
+    return g_orig_last_one(self, i, p, gp);  // logged only: one pose without the head to aim from
+}
+
+void __fastcall HookAbs(void* self, vr::ETrackingUniverseOrigin o, float t, vr::TrackedDevicePose_t* p, uint32_t n) {
+    g_orig_abs(self, o, t, p, n);
+    ++g_count_abs.n;
+    Rewrite(p, n);
+}
+
+bool __fastcall HookState(void* self, vr::TrackedDeviceIndex_t i, void* s, uint32_t n) {
+    ++g_count_state.n;
+    return g_orig_state(self, i, s, n);
+}
+
+bool __fastcall HookStatePose(void* self, vr::ETrackingUniverseOrigin o, vr::TrackedDeviceIndex_t i, void* s, uint32_t n, vr::TrackedDevicePose_t* p) {
+    ++g_count_state_pose.n;
+    return g_orig_state_pose(self, o, i, s, n, p);  // logged only for now
+}
+
+vr::TrackedDeviceIndex_t __fastcall HookRole(void* self, vr::ETrackedControllerRole r) {
+    ++g_count_role.n;
+    return g_orig_role_to_index(self, r);
+}
+
+bool __fastcall HookEventPose(void* self, vr::ETrackingUniverseOrigin o, void* e, uint32_t n, vr::TrackedDevicePose_t* p) {
+    ++g_count_event_pose.n;
+    return g_orig_event_pose(self, o, e, n, p);
+}
+
+template <typename Fn>
+void Patch(void* obj, int slot, Fn hook, Fn& orig, const char* name) {
+    void** vtable = *reinterpret_cast<void***>(obj);
+    if (vtable[slot] == reinterpret_cast<void*>(hook)) return;
+    DWORD old;
+    VirtualProtect(&vtable[slot], sizeof(void*), PAGE_READWRITE, &old);
+    orig = reinterpret_cast<Fn>(vtable[slot]);
+    vtable[slot] = reinterpret_cast<void*>(hook);
+    VirtualProtect(&vtable[slot], sizeof(void*), old, &old);
+    Log("hooked %s (slot %d)", name, slot);
+}
+
+// ---- the real DLL --------------------------------------------------------------------------
+
+using FnGetGeneric = void*(__cdecl*)(const char*, vr::EVRInitError*);
+FnGetGeneric g_real_get_generic = nullptr;
+
+void Init(HMODULE self) {
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(self, path, MAX_PATH);
+    g_dir = path;
+    g_dir.resize(g_dir.find_last_of(L'\\') + 1);
+    g_log = _wfopen((g_dir + L"rez_gaze.log").c_str(), L"w");
+    LARGE_INTEGER f;
+    QueryPerformanceFrequency(&f);
+    g_qpf = f.QuadPart;
+    g_cfg = ReadConfig();
+    Log("rez_gaze spike loaded; mode %s, hands %s%s, distance %.1f, pitch %.1f, yaw %.1f, smooth %.0f ms",
+        ModeName(g_cfg.mode), g_cfg.right ? "R" : "", g_cfg.left ? "L" : "", g_cfg.distance, g_cfg.pitch,
+        g_cfg.yaw, g_cfg.smooth_ms);
+    HMODULE real = LoadLibraryW((g_dir + L"openvr_api_real.dll").c_str());
+    if (!real) {
+        Log("can't load openvr_api_real.dll (error %lu)", GetLastError());
+        return;
+    }
+    g_real_get_generic = reinterpret_cast<FnGetGeneric>(GetProcAddress(real, "VR_GetGenericInterface"));
+    std::thread(OscThread, g_cfg.port).detach();
+}
+
+}  // namespace
+
+extern "C" void* __cdecl VR_GetGenericInterface(const char* version, vr::EVRInitError* err) {
+    if (!g_real_get_generic) {
+        if (err) *err = vr::VRInitError_Init_InterfaceNotFound;
+        return nullptr;
+    }
+    void* obj = g_real_get_generic(version, err);
+    static std::mutex m;
+    std::lock_guard<std::mutex> lock(m);
+    static std::string seen;
+    if (seen.find(std::string(version) + ";") == std::string::npos) {
+        seen += std::string(version) + ";";
+        Log("VR_GetGenericInterface(%s) -> %p", version, obj);
+    }
+    if (!obj) return obj;
+    if (std::strcmp(version, "IVRSystem_015") == 0) {
+        g_system = static_cast<vr::IVRSystem*>(obj);
+        Patch(obj, 10, &HookAbs, g_orig_abs, "IVRSystem::GetDeviceToAbsoluteTrackingPose");
+        Patch(obj, 17, &HookRole, g_orig_role_to_index, "IVRSystem::GetTrackedDeviceIndexForControllerRole");
+        Patch(obj, 29, &HookEventPose, g_orig_event_pose, "IVRSystem::PollNextEventWithPose");
+        Patch(obj, 32, &HookState, g_orig_state, "IVRSystem::GetControllerState");
+        Patch(obj, 33, &HookStatePose, g_orig_state_pose, "IVRSystem::GetControllerStateWithPose");
+    } else if (std::strcmp(version, "IVRCompositor_015") == 0) {
+        Patch(obj, 2, &HookWait, g_orig_wait, "IVRCompositor::WaitGetPoses");
+        Patch(obj, 3, &HookLast, g_orig_last, "IVRCompositor::GetLastPoses");
+        Patch(obj, 4, &HookLastOne, g_orig_last_one, "IVRCompositor::GetLastPoseForTrackedDeviceIndex");
+    }
+    return obj;
+}
+
+BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(inst);
+        Init(inst);
+    }
+    return TRUE;
+}
