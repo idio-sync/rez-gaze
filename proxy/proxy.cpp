@@ -21,6 +21,10 @@
 //                          auto = 39.4 when the tracking system is "oculus", else 0
 //   yaw=0, pitch=0         trim in head space, degrees (positive = right, up)
 //   smooth_ms=0            exponential smoothing of the gaze direction
+//   gain_yaw=1, gain_pitch=1  multiply the gaze angles (cursor not reaching the edges)
+//   helper=1               start the helper (rez_gaze folder)
+//   helper_delay_s=10      seconds after the first WaitGetPoses before starting it (an overlay
+//                          app joining during Rez's VR start-up left Rez black and silent)
 //   source=auto|helper|osc gaze from the helper (rez_gaze\rez_gaze_helper.exe, started on the
 //                          first IVRSystem_015) if fresh, else Steam Link OSC, else straight
 //                          ahead; helper/osc forces one
@@ -35,6 +39,7 @@
 #include "aim.h"
 #include "gaze_source.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdarg>
@@ -73,6 +78,9 @@ struct Config {
     bool right = true, left = true;
     bool tilt_auto = true;
     double tilt = 0, pitch = 0, yaw = 0, smooth_ms = 0;
+    double gain_yaw = 1, gain_pitch = 1;
+    bool helper = true;
+    double helper_delay_s = 10;
     int port = 9000;
     rezgaze::SourceMode source = rezgaze::SourceMode::Auto;
 };
@@ -100,6 +108,10 @@ Config ReadConfig() {
     c.pitch = num(L"pitch", 0);
     c.yaw = num(L"yaw", 0);
     c.smooth_ms = num(L"smooth_ms", 0);
+    c.gain_yaw = num(L"gain_yaw", 1);
+    c.gain_pitch = num(L"gain_pitch", 1);
+    c.helper = num(L"helper", 1) != 0;
+    c.helper_delay_s = num(L"helper_delay_s", 10);
     c.port = static_cast<int>(num(L"port", 9000));
     GetPrivateProfileStringW(L"rez_gaze", L"source", L"auto", buf, 64, ini.c_str());
     c.source = _wcsicmp(buf, L"helper") == 0 ? rezgaze::SourceMode::Helper
@@ -163,6 +175,8 @@ struct RezState {
     int selected = -1;      // manager +0xa08: 0 left, 1 right
     int is_oculus = -1;     // manager +0xc58
     float drift = 0;        // manager +0xc70: type-1 yaw offset (rad)
+    float cursor_yaw = 0;   // DAT_1409ac298: the aim yaw the game computed this frame (rad)
+    float cursor_pitch = 0; // DAT_1409ac18c: the aim pitch (rad)
 };
 
 bool ReadRezState(RezState& s) {
@@ -170,6 +184,8 @@ bool ReadRezState(RezState& s) {
     __try {
         s.control_type = *reinterpret_cast<unsigned char*>(g_rez_base + 0x52265c);
         s.input_device = *reinterpret_cast<int*>(g_rez_base + 0x4cc8a8);
+        s.cursor_yaw = *reinterpret_cast<float*>(g_rez_base + 0x9ac298);
+        s.cursor_pitch = *reinterpret_cast<float*>(g_rez_base + 0x9ac18c);
         auto mgr = *reinterpret_cast<uintptr_t*>(g_rez_base + 0xa1e360);
         if (mgr) {
             s.selected = *reinterpret_cast<int*>(mgr + 0xa08);
@@ -296,6 +312,10 @@ V3 HeadGaze(const Config& c) {
 }
 
 std::atomic<long> g_rewrites{0};
+// Largest |angle| (degrees) this 5 s: what the DLL aimed at, and what the game computed from it
+// (sampled each frame). If the game's stays below ours, the game clamps; if both are small, the
+// gaze itself is compressed.
+double g_max_want_yaw = 0, g_max_want_pitch = 0, g_max_game_yaw = 0, g_max_game_pitch = 0;
 
 void Rewrite(vr::TrackedDevicePose_t* poses, uint32_t n) {
     if (!poses || n == 0) return;
@@ -307,7 +327,11 @@ void Rewrite(vr::TrackedDevicePose_t* poses, uint32_t n) {
     if (c.mode == Mode::Log || !poses[0].bPoseIsValid) return;
     // The game projects the controller ray 400 m out, so the hand's offset from the head
     // doesn't matter: only the rotation is rewritten.
-    V3 gaze = c.mode == Mode::Gaze ? HeadGaze(c) : V3{0, 0, -1};
+    V3 gaze = c.mode == Mode::Gaze ? rezgaze::ScaleGaze(HeadGaze(c), c.gain_yaw, c.gain_pitch) : V3{0, 0, -1};
+    double want_yaw = std::atan2(gaze.x, -gaze.z) * 57.29577951308232 + c.yaw;
+    double want_pitch = std::atan2(gaze.y, -gaze.z) * 57.29577951308232 + c.pitch;
+    if (std::fabs(want_yaw) > g_max_want_yaw) g_max_want_yaw = std::fabs(want_yaw);
+    if (std::fabs(want_pitch) > g_max_want_pitch) g_max_want_pitch = std::fabs(want_pitch);
     double tilt = c.tilt_auto ? (g_is_oculus ? 39.4 : 0.0) : c.tilt;
     Mat3 aim = rezgaze::AimRotation(Rotation(poses[0].mDeviceToAbsoluteTracking), gaze, tilt, c.yaw, c.pitch);
     for (vr::TrackedDeviceIndex_t i : {c.right ? g_right : vr::k_unTrackedDeviceIndexInvalid,
@@ -352,6 +376,9 @@ void ReportEveryFiveSeconds() {
         "age %.0f ms",
         s.c_str(), g_rewrites.exchange(0), rezgaze::SourceName(g_source), status.c_str(), helper_age,
         tracked ? " tracked" : "", hd.x, hd.y, hd.z, g_osc.TakePacketCount(), osc_age);
+    Log("     aim max |yaw| %.1f, |pitch| %.1f deg (DLL) vs %.1f, %.1f (game)", g_max_want_yaw, g_max_want_pitch,
+        g_max_game_yaw, g_max_game_pitch);
+    g_max_want_yaw = g_max_want_pitch = g_max_game_yaw = g_max_game_pitch = 0;
     RezState st;
     if (ReadRezState(st)) {
         static const char* kTypes[] = {"head+controller (drifts past 30 deg; use controller only)",
@@ -365,6 +392,23 @@ void ReportEveryFiveSeconds() {
 }
 
 void Tick() {
+    RezState st;
+    if (ReadRezState(st)) {
+        g_max_game_yaw = std::max(g_max_game_yaw, std::fabs(st.cursor_yaw * 57.29577951308232));
+        g_max_game_pitch = std::max(g_max_game_pitch, std::fabs(st.cursor_pitch * 57.29577951308232));
+    }
+    // Start the helper a while after VR is running, not during Rez's VR start-up: started then,
+    // its overlay app left Rez black and silent (2026-10-22). Once per process.
+    static LONGLONG first = 0;
+    LONGLONG now = Qpc();
+    if (!first) first = now;
+    Config c;
+    {
+        std::lock_guard<std::mutex> lock(g_cfg_mutex);
+        c = g_cfg;
+    }
+    if (c.helper && now - first >= static_cast<LONGLONG>(c.helper_delay_s * g_qpf))
+        g_helper.Start(g_dir + L"rez_gaze\\rez_gaze_helper.exe", GetCurrentProcessId(), Log);
     RefreshEverySecond();
     ReportEveryFiveSeconds();
 }
@@ -489,9 +533,8 @@ extern "C" void* __cdecl VR_GetGenericInterface(const char* version, vr::EVRInit
     if (!obj) return obj;
     if (std::strcmp(version, "IVRSystem_015") == 0) {
         g_system = static_cast<vr::IVRSystem*>(obj);
-        // VR is up (SteamVR running), so the helper's overlay app can't start SteamVR itself.
-        // Once per process; flat runs never get here.
-        g_helper.Start(g_dir + L"rez_gaze\\rez_gaze_helper.exe", GetCurrentProcessId(), Log);
+        // The helper is started from Tick (WaitGetPoses), helper_delay_s after VR is running;
+        // flat runs never get there.
         Patch(obj, 10, &HookAbs, g_orig_abs, "IVRSystem::GetDeviceToAbsoluteTrackingPose");
         Patch(obj, 17, &HookRole, g_orig_role_to_index, "IVRSystem::GetTrackedDeviceIndexForControllerRole");
         Patch(obj, 29, &HookEventPose, g_orig_event_pose, "IVRSystem::PollNextEventWithPose");

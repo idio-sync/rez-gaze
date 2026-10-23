@@ -25,6 +25,10 @@ struct Mat3 {
 
 inline V3 Apply(const Mat3& m, V3 v) { return m.col[0] * v.x + m.col[1] * v.y + m.col[2] * v.z; }
 
+// The head-space gaze with its yaw and pitch angles (atan2(x,-z), atan2(y,-z)) multiplied by the
+// gains, each capped at 80 degrees. For when the cursor doesn't reach as far as the eyes look.
+V3 ScaleGaze(V3 gaze_head, double gain_yaw, double gain_pitch);
+
 // The controller rotation (world) whose -Z points where the eyes look. gaze_head is the gaze in
 // head space; trim_yaw_deg (positive = right) and trim_pitch_deg (positive = up) shift it in
 // head space; roll follows the head's up. tilt_deg rotates the result about its own X, to undo

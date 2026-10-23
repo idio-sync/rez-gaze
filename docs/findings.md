@@ -136,6 +136,44 @@ Branch `gaze-helper`; plan `docs/superpowers/plans/2026-10-22-gaze-helper.md`.
 - **Not yet run against real OpenVR:** the helper's running path (SteamVR on, headset on).
   That's the first item of the next headset session.
 
+## First headset session (2026-10-22 evening, PC streaming, main f5134b6 in REZ\)
+
+- **Black, silent Rez whenever the helper started.** Bisected over three runs:
+  - with rez_hfr disabled: still black;
+  - stock Rez (original `openvr_api.dll`): fine;
+  - the stand-in with `rez_gaze\` renamed (helper can't start): fine.
+
+  The helper was then started as an OpenVR overlay app right after `IVRSystem_015`, during
+  Rez's VR start-up. Rez kept calling `WaitGetPoses` ~130/s but showed nothing and played no
+  sound. Earlier, an overlay probe started *beside an already running* Rez was fine (run 3).
+  Unconfirmed fix: the DLL now starts the helper `helper_delay_s` (default 10) after the first
+  `WaitGetPoses`; `helper=0` turns it off. `REZ\rez_gaze\` is still renamed `rez_gaze_off\`.
+- **What log mode showed:**
+  - HMD tracking system `"oculus"`, model "Oculus Quest2": SteamVR's legacy simulation, so
+    `tilt=auto` applies its 39.4°;
+  - right hand device 1, class 2; the left controller wasn't on;
+  - after choosing "motion controller only" and pressing A: control type 1, input device 3,
+    selected right.
+- **`mode=head`:** the cursor followed the head and ignored the controller, so the pose rewrite
+  works. Rewrites stop while the HMD pose is invalid (headset off).
+- **`mode=gaze` over OSC works.** The user aimed by eye.
+  - **Tuning:**
+    - with prescription lens inserts the aim was high;
+    - without them, `pitch=0` was much better;
+    - slight up-and-right creep remained, trimmed with `yaw=-0.5`, `pitch=-0.5`.
+  - **Jitter:** `smooth_ms` 20 jittery, 30 nearly, 40 chosen, 80–120 smooth but slow. Part of
+    it is OSC's ~57 samples/s against Rez's 60 Hz cursor tick.
+  - **The cursor didn't reach the view edges.** `gain_yaw`/`gain_pitch` were added (not yet
+    tried), and the 5 s log now prints the DLL's vs the game's largest aim angles, to tell gaze
+    compression from a game clamp.
+- **Two things threw the aim off mid-session:**
+  - Rez switched to input device 2 (mouse/keyboard), which ignores the controller pose. A
+    controller press switched it back.
+  - After the headset came off or moved (OSC gap of 13 s), the tracker read straight ahead as
+    15–21° right until the headset was re-seated.
+- **rez_hfr in VR with gameplay** (enabled=1, eye aim on, helper off): it ran at 136 fps on a
+  59 Hz tick; the user moved on to debug it in that session before giving feedback.
+
 ## Planned mod (unchanged by the probe's outcome, except where gaze comes from)
 
 - A proxy `openvr_api.dll`, one copy in each program's DLL folder (above), forwarding every

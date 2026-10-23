@@ -7,6 +7,7 @@
 
 #include <tlhelp32.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -56,6 +57,12 @@ int main(int argc, char** argv) {
         std::printf("FAIL: VR_GetGenericInterface returned %p, %p\n", a, b);
         return 1;
     }
+    // The stand-in starts the helper from its WaitGetPoses hook (compositor slot 2), after
+    // helper_delay_s (0 in the harness ini): call it as the game would, several times.
+    void* compositor = get("IVRCompositor_015", &err);
+    using FnWait = int(__fastcall*)(void*, void*, uint32_t, void*, uint32_t);
+    auto wait = reinterpret_cast<FnWait>((*reinterpret_cast<void***>(compositor))[2]);
+    for (int i = 0; i < 5; ++i) wait(compositor, nullptr, 0, nullptr, 0);
     Sleep(2000);
     int children = CountHelperChildren();
 

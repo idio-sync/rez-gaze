@@ -20,6 +20,18 @@ V3 RotX(V3 v, double a) {
 
 }  // namespace
 
+V3 ScaleGaze(V3 gaze_head, double gain_yaw, double gain_pitch) {
+    V3 g = Norm(gaze_head);
+    if (g.z >= 0) return g;  // not in front: leave alone
+    const double cap = 80 * kDeg;
+    auto scale = [&](double a, double k) {
+        double s = a * k;
+        return s > cap ? cap : s < -cap ? -cap : s;
+    };
+    double yaw = scale(std::atan2(g.x, -g.z), gain_yaw), pitch = scale(std::atan2(g.y, -g.z), gain_pitch);
+    return Norm({std::tan(yaw), std::tan(pitch), -1});
+}
+
 Mat3 AimRotation(const Mat3& head, V3 gaze_head, double tilt_deg, double trim_yaw_deg, double trim_pitch_deg) {
     V3 g = RotY(RotX(Norm(gaze_head), trim_pitch_deg * kDeg), -trim_yaw_deg * kDeg);
     V3 f = Norm(Apply(head, g));

@@ -90,6 +90,22 @@ TEST(aim_trim) {
     EXPECT(std::fabs(pitch - 3 * kDeg) < 1e-6 && std::fabs(yaw) < 1e-6);
 }
 
+TEST(scale_gaze_multiplies_angles) {
+    V3 g = Norm({std::tan(10 * kDeg), std::tan(5 * kDeg), -1});
+    V3 s = ScaleGaze(g, 1.5, 1.2);
+    EXPECT(std::fabs(std::atan2(s.x, -s.z) - 15 * kDeg) < 1e-9);
+    EXPECT(std::fabs(std::atan2(s.y, -s.z) - 6 * kDeg) < 1e-9);
+    V3 same = ScaleGaze(g, 1, 1);
+    EXPECT(std::fabs(same.x - g.x) < 1e-12 && std::fabs(same.y - g.y) < 1e-12 && std::fabs(same.z - g.z) < 1e-12);
+}
+
+TEST(scale_gaze_stays_in_front) {
+    // A large gain can't push the gaze past 80 degrees (or behind the head).
+    V3 s = ScaleGaze(Norm({std::tan(40 * kDeg), 0, -1}), 4, 4);
+    EXPECT(s.z < 0);
+    EXPECT(std::atan2(s.x, -s.z) <= 80 * kDeg + 1e-9);
+}
+
 TEST(aim_orthonormal) {
     int bad = 0;
     for (const Case& c : Cases()) {
