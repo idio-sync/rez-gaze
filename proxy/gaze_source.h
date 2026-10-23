@@ -35,10 +35,13 @@ public:
     bool Start(const std::wstring& helper_exe, DWORD game_pid, LogFn log);
     // False until the helper's block exists and reads consistently.
     bool Read(V3& dir, double& age_ms, bool& tracked, std::string& status);
+    // QueryPerformanceCounter time of the sample the last successful Read returned.
+    LONGLONG SampleQpc() const { return sample_qpc_; }
     // True once the started process has exited, with its exit code.
     bool ExitCode(DWORD& code);
 
 private:
+    LONGLONG sample_qpc_ = 0;
     std::once_flag once_;
     bool started_ = false;
     DWORD game_pid_ = 0;
@@ -53,6 +56,8 @@ public:
     void Start(int port, LogFn log);
     // False if no packet has arrived yet.
     bool Read(V3& dir, double& age_ms);
+    // Arrival time (QueryPerformanceCounter) of the sample the last successful Read returned.
+    LONGLONG SampleQpc() const { return sample_qpc_; }
     long TakePacketCount() { return packets_.exchange(0); }
 
     void HandlePacket(const unsigned char* p, size_t n);  // public for tests
@@ -61,6 +66,7 @@ private:
     std::mutex mutex_;
     V3 dir_{0, 0, -1};
     LONGLONG qpc_ = 0;
+    LONGLONG sample_qpc_ = 0;
     std::atomic<long> packets_{0};
 };
 

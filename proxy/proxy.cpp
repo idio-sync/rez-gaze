@@ -20,7 +20,9 @@
 //   tilt=auto              degrees about the controller's X added to undo the game's offset;
 //                          auto = 39.4 when the tracking system is "oculus", else 0
 //   yaw=0, pitch=0         trim in head space, degrees (positive = right, up)
-//   smooth_ms=0            exponential smoothing of the gaze direction
+//   smooth_ms=0            exponential smoothing of the gaze direction (filter=ema)
+//   filter=ema|euro        euro: One Euro filter instead, steady at rest, quick in saccades
+//   euro_min_cutoff=1.0, euro_beta=0.05   its cut-off (Hz) at rest, and speed gain
 //   gain_yaw=1, gain_pitch=1  multiply the gaze angles (cursor not reaching the edges)
 //   helper=1               start the helper (rez_gaze folder)
 //   helper_delay_s=10      seconds after the first WaitGetPoses before starting it (an overlay
@@ -37,6 +39,7 @@
 #include <openvr.h>
 
 #include "aim.h"
+#include "filter.h"
 #include "gaze_source.h"
 
 #include <algorithm>
@@ -79,6 +82,8 @@ struct Config {
     bool tilt_auto = true;
     double tilt = 0, pitch = 0, yaw = 0, smooth_ms = 0;
     double gain_yaw = 1, gain_pitch = 1;
+    bool filter_euro = false;
+    double euro_min_cutoff = 1.0, euro_beta = 0.05;
     bool helper = true;
     double helper_delay_s = 10;
     int port = 9000;
@@ -109,6 +114,10 @@ Config ReadConfig() {
     c.yaw = num(L"yaw", 0);
     c.smooth_ms = num(L"smooth_ms", 0);
     c.gain_yaw = num(L"gain_yaw", 1);
+    GetPrivateProfileStringW(L"rez_gaze", L"filter", L"ema", buf, 64, ini.c_str());
+    c.filter_euro = _wcsicmp(buf, L"euro") == 0;
+    c.euro_min_cutoff = num(L"euro_min_cutoff", 1.0);
+    c.euro_beta = num(L"euro_beta", 0.05);
     c.gain_pitch = num(L"gain_pitch", 1);
     c.helper = num(L"helper", 1) != 0;
     c.helper_delay_s = num(L"helper_delay_s", 10);
@@ -151,6 +160,7 @@ FnRoleToIndex g_orig_role_to_index = nullptr;
 vr::TrackedDeviceIndex_t g_right = vr::k_unTrackedDeviceIndexInvalid;
 vr::TrackedDeviceIndex_t g_left = vr::k_unTrackedDeviceIndexInvalid;
 V3 g_smoothed{0, 0, -1};
+rezgaze::OneEuroGaze g_euro(1.0, 0.05);
 LONGLONG g_smoothed_qpc = 0;
 
 // ---- game state, read-only (addresses from docs/aim-re.md, REZ.exe 2.8 only) --------------
@@ -301,6 +311,13 @@ V3 HeadGaze(const Config& c) {
     if (src == rezgaze::Source::Helper) g = helper_dir;
     else if (src == rezgaze::Source::Osc) g = osc_dir;
     LONGLONG now = Qpc();
+    if (c.filter_euro && src != rezgaze::Source::Head) {
+        // Filter each sample once, at its own time: this runs every frame, faster than samples
+        // arrive, and a repeated sample with a tiny time step would read as a huge speed.
+        LONGLONG sample = src == rezgaze::Source::Helper ? g_helper.SampleQpc() : g_osc.SampleQpc();
+        g_euro.SetParams(c.euro_min_cutoff, c.euro_beta);
+        return g_euro.Filter(g, static_cast<double>(sample) / g_qpf);
+    }
     if (c.smooth_ms > 0 && g_smoothed_qpc) {
         double dt_ms = (now - g_smoothed_qpc) * 1000.0 / g_qpf;
         double k = 1 - std::exp(-dt_ms / c.smooth_ms);

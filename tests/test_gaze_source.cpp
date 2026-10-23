@@ -123,6 +123,31 @@ TEST(helper_read_reports_age_and_stale_is_rejected) {
     EXPECT(ChooseSource(SourceMode::Auto, age, tracked, -1) == Source::Head);
 }
 
+TEST(sources_report_a_stable_sample_time) {
+    // The filter must see each sample once: repeated reads of the same sample give the same time.
+    OscSource osc;
+    std::string p = GazeMessage("/tracking/eye/CenterVecFull", 0, 0, 1);
+    osc.HandlePacket(reinterpret_cast<const unsigned char*>(p.data()), p.size());
+    V3 d;
+    double age;
+    EXPECT(osc.Read(d, age));
+    LONGLONG first = osc.SampleQpc();
+    Sleep(5);
+    EXPECT(osc.Read(d, age));
+    EXPECT(first != 0 && osc.SampleQpc() == first);
+
+    DWORD pid = 0x7FFF0003;
+    HelperSource h;
+    h.Start(L"C:\\nonexistent\\rez_gaze_helper.exe", pid, NoLog);
+    GazeShmWriter w;
+    EXPECT(w.Create(ShmName(pid)));
+    w.Publish(GazeSampleShm{{0, 0, -1}, kGazeTracked, 123456, 1});
+    bool tracked;
+    std::string status;
+    EXPECT(h.Read(d, age, tracked, status));
+    EXPECT(h.SampleQpc() == 123456);
+}
+
 TEST(osc_other_addresses_ignored) {
     OscSource osc;
     std::string p = GazeMessage("/sl/eyeTrackedGazePoint", 0, 0, -1);

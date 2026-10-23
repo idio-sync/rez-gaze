@@ -59,6 +59,19 @@ Start SteamVR with the Frame first, then Rez. Logs: `REZ\rez_gaze.log` (the DLL)
 3. **`mode=gaze`.** The cursor follows the eyes. Play an area.
 4. **`source=helper`, then `source=osc`.** Compare how they feel. The 5 s log lines show each
    source's age.
+Next session, after the 2026-10-22 run (tuned there: `smooth_ms=40`, `yaw=-0.5`,
+`pitch=-0.5`, no prescription lens inserts):
+
+- **Helper with the delayed start.** Rename `REZ\rez_gaze_off\` back to `rez_gaze\`, keep
+  `helper_delay_s=10`, then launch. If Rez goes black when the helper starts (about 10 s in),
+  set `helper=0` and tell me. If it stays fine, try `source=helper` against `source=osc`.
+- **`filter=euro`** (`euro_min_cutoff=1.0`, `euro_beta=0.05`) against `filter=ema` with
+  `smooth_ms=40`. It should be steadier when you hold your gaze and quicker when you jump.
+- **Edges.** Look at the far left and right. The 5 s line `aim max |yaw| … (DLL) vs … (game)`
+  tells whether the gaze or the game is short. Raise `gain_yaw` (e.g. 1.2) if it's the gaze.
+- **Rez's input switching to mouse/keyboard** (input device 2) breaks gaze aim; press a
+  controller button to switch back.
+
 5. **Display-rate cursor.** This comes from the frame-rate mod (branch `hfr`, `c91cc6f`).
    Toggle `cursor=0` / `cursor=1` in `REZ\rez_hfr.ini` (re-read every 2 s): first with
    `mode=head`, then with gaze. With `cursor=1` the cursor should move at display rate instead

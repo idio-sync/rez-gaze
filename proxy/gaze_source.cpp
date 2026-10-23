@@ -84,6 +84,7 @@ bool HelperSource::Read(V3& dir, double& age_ms, bool& tracked, std::string& sta
     if (!reader_->shm.Read(s, &status)) return false;
     dir = {s.dir[0], s.dir[1], s.dir[2]};
     age_ms = s.qpc ? AgeMs(s.qpc) : -1;
+    sample_qpc_ = s.qpc;
     tracked = (s.flags & kGazeTracked) != 0;
     return true;
 }
@@ -139,6 +140,7 @@ bool OscSource::Read(V3& dir, double& age_ms) {
     if (qpc_ == 0) return false;
     dir = dir_;
     age_ms = AgeMs(qpc_);
+    sample_qpc_ = qpc_;
     return true;
 }
 
