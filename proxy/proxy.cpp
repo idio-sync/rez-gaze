@@ -652,7 +652,7 @@ void Init(HMODULE self) {
     QueryPerformanceFrequency(&f);
     g_qpf = f.QuadPart;
     g_cfg = ReadConfig();
-    Log("rez_gaze spike loaded; mode %s, hands %s%s, tilt %s, pitch %.1f, yaw %.1f, smooth %.0f ms",
+    Log("rez_gaze %s loaded; mode %s, hands %s%s, tilt %s, pitch %.1f, yaw %.1f, smooth %.0f ms", REZ_GAZE_VERSION,
         ModeName(g_cfg.mode), g_cfg.right ? "R" : "", g_cfg.left ? "L" : "",
         g_cfg.tilt_auto ? "auto" : std::to_string(g_cfg.tilt).c_str(), g_cfg.pitch, g_cfg.yaw, g_cfg.smooth_ms);
     FindRez();

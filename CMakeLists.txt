@@ -4,6 +4,9 @@ project(rez_gaze CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Stamped into the stand-in DLL and the helper, and logged at start (CI: nightly-<short sha>).
+set(REZ_GAZE_VERSION "dev" CACHE STRING "version shown in rez_gaze.log and rez_gaze_helper.log")
+
 add_executable(gaze_probe
     probe/main.cpp
     probe/recorder.cpp
@@ -24,7 +27,7 @@ target_link_libraries(gaze_probe PRIVATE
 add_executable(rez_gaze_helper helper/gaze_helper.cpp)
 set_target_properties(rez_gaze_helper PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/rez_gaze)
 target_include_directories(rez_gaze_helper PRIVATE third_party/openvr/headers)
-target_compile_definitions(rez_gaze_helper PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+target_compile_definitions(rez_gaze_helper PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS REZ_GAZE_VERSION="${REZ_GAZE_VERSION}")
 target_link_libraries(rez_gaze_helper PRIVATE ${CMAKE_SOURCE_DIR}/third_party/openvr/lib/win64/openvr_api.lib winmm)
 add_custom_command(TARGET rez_gaze_helper POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -46,6 +49,10 @@ add_test(NAME helper_smoke_hang COMMAND powershell -NoProfile -ExecutionPolicy B
     -File ${CMAKE_SOURCE_DIR}/tests/helper_smoke.ps1 -Helper ${CMAKE_BINARY_DIR}/rez_gaze/rez_gaze_helper.exe -Hang)
 add_test(NAME helper_smoke_fake COMMAND powershell -NoProfile -ExecutionPolicy Bypass
     -File ${CMAKE_SOURCE_DIR}/tests/helper_smoke.ps1 -Helper ${CMAKE_BINARY_DIR}/rez_gaze/rez_gaze_helper.exe -Fake)
+add_test(NAME package COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+    -File ${CMAKE_SOURCE_DIR}/tests/package_test.ps1 -Release ${CMAKE_SOURCE_DIR}/release -Out ${CMAKE_BINARY_DIR})
+add_test(NAME installer COMMAND powershell -NoProfile -ExecutionPolicy Bypass
+    -File ${CMAKE_SOURCE_DIR}/tests/install_test.ps1 -Release ${CMAKE_SOURCE_DIR}/release)
 
 # Spike: stand-in REZ\openvr_api.dll (built into out\proxy so it doesn't clash with the probe's copy).
 add_library(rez_gaze_proxy SHARED proxy/proxy.cpp proxy/aim.cpp proxy/gaze_source.cpp proxy/filter.cpp proxy/calib.cpp proxy/forwards.cpp proxy/openvr_api.def)
@@ -54,7 +61,7 @@ set_target_properties(rez_gaze_proxy PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/proxy
     ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/proxy)
 target_include_directories(rez_gaze_proxy PRIVATE third_party/openvr/headers)
-target_compile_definitions(rez_gaze_proxy PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+target_compile_definitions(rez_gaze_proxy PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS REZ_GAZE_VERSION="${REZ_GAZE_VERSION}")
 target_link_libraries(rez_gaze_proxy PRIVATE ws2_32)
 
 add_custom_command(TARGET gaze_probe POST_BUILD

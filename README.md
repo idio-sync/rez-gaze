@@ -23,7 +23,22 @@ enemies to mark them, as the PS VR2 version's eye-only mode does. In progress.
 `ctest --test-dir out --output-on-failure`. All tests run without SteamVR or the headset, and
 none of them starts SteamVR.
 
+## Releases
+
+Every push to `main` triggers `.github/workflows/nightly.yml` on a Windows runner:
+1. build (NMake, MSVC);
+2. run all tests;
+3. package `rez-gaze-nightly-<sha>.zip`;
+4. replace the single **nightly** pre-release (`releases/tag/nightly`).
+
+A failing build or test publishes nothing. Locally, the same zip comes from
+`powershell -ExecutionPolicy Bypass -File release\package.ps1 -Out out -Version dev`.
+The zip holds the stand-in, `rez_gaze\`, a default `rez_gaze.ini`, `install.ps1` /
+`uninstall.ps1` (tested by `tests/install_test.ps1`) and a user README (`release/README.txt`).
+
 ## Install (classic Rez only)
+
+The release zip's `install.ps1` does the following steps for you; by hand:
 
 With no Rez running, in `Rez Infinite\REZ\`:
 

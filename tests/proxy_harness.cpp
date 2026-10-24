@@ -74,6 +74,15 @@ int main(int argc, char** argv) {
         return children == 0 && logged ? 0 : 1;
     }
 
+    // The stand-in names its version in the log's first line ("rez_gaze <version> loaded").
+    {
+        std::string first = ReadFile(dir + L"rez_gaze.log");
+        first = first.substr(0, first.find('\n'));
+        if (first.find(" loaded") == std::string::npos || first.find("rez_gaze dev") == std::string::npos) {
+            std::printf("FAIL: stand-in log's first line doesn't name the version: %s\n", first.c_str());
+            return 1;
+        }
+    }
     // Count starts from the stand-in's log: a helper whose VR init failed (SteamVR off) has
     // already exited, so live children alone can't show it was started once.
     std::string log = ReadFile(dir + L"rez_gaze.log");

@@ -106,7 +106,8 @@ int main(int argc, char** argv) {
         Log("usage: rez_gaze_helper --parent <pid> [--app overlay|background] [--hz N]");
         return 2;
     }
-    Log("rez_gaze_helper for pid %lu, app %s, %d Hz%s", parent_pid, app.c_str(), hz, fake ? ", fake gaze" : "");
+    Log("rez_gaze_helper %s for pid %lu, app %s, %d Hz%s", REZ_GAZE_VERSION, parent_pid, app.c_str(), hz,
+        fake ? ", fake gaze" : "");
 
     rezgaze::GazeShmWriter shm;
     if (!shm.Create(rezgaze::ShmName(parent_pid))) {
