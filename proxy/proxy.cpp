@@ -21,6 +21,10 @@
 //                          as calib= and the mode returns to gaze (trims reset)
 //   calib=m00,...,m12      angle-space correction from mode=calibrate (written by it)
 //   calib_seconds=15       how long calibration collects before fitting
+//   calib_combo=both|one   start (or cancel) calibration from the controllers: hold both
+//                          thumbsticks down (both), or either one (one), for calib_hold_s
+//   calib_hold_s=2         (3 by default with calib_combo=one); 0 turns the combination off.
+//                          Buzzes: short = started, double = saved, long = cancelled
 //   hand=right|left|both   which controller(s) to rewrite
 //   tilt=auto              degrees about the controller's X added to undo the game's offset;
 //                          auto = 39.4 when the tracking system is "oculus", else 0
@@ -45,6 +49,7 @@
 
 #include "aim.h"
 #include "calib.h"
+#include "combo.h"
 #include "filter.h"
 #include "gaze_source.h"
 
@@ -57,6 +62,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -91,6 +97,8 @@ struct Config {
     bool filter_euro = false;
     rezgaze::Affine2 calib;  // identity unless rez_gaze.ini has calib=
     double calib_seconds = 15;
+    bool calib_combo_one = false;
+    double calib_hold_s = 2;
     double euro_min_cutoff = 1.0, euro_beta = 0.05;
     bool helper = true;
     double helper_delay_s = 10;
@@ -135,6 +143,9 @@ Config ReadConfig() {
         rezgaze::ParseCalibration(text, c.calib);  // stays identity if absent or malformed
     }
     c.calib_seconds = num(L"calib_seconds", 15);
+    GetPrivateProfileStringW(L"rez_gaze", L"calib_combo", L"both", buf, 64, ini.c_str());
+    c.calib_combo_one = _wcsicmp(buf, L"one") == 0;
+    c.calib_hold_s = num(L"calib_hold_s", c.calib_combo_one ? 3 : 2);
     c.euro_min_cutoff = num(L"euro_min_cutoff", 1.0);
     c.euro_beta = num(L"euro_beta", 0.05);
     c.gain_pitch = num(L"gain_pitch", 1);
@@ -356,6 +367,43 @@ std::atomic<long> g_rewrites{0};
 // gaze itself is compressed.
 double g_max_want_yaw = 0, g_max_want_pitch = 0, g_max_game_yaw = 0, g_max_game_pitch = 0;
 
+// ---- controller buzzes (the mod can't draw in the headset, so it answers by haptics) --------
+
+struct BuzzWindow {
+    double from_ms, to_ms;
+};
+const std::vector<BuzzWindow> kBuzzStart{{0, 150}};
+const std::vector<BuzzWindow> kBuzzDone{{0, 120}, {250, 370}};
+const std::vector<BuzzWindow> kBuzzCancel{{0, 600}};
+
+std::mutex g_buzz_mutex;
+std::vector<BuzzWindow> g_buzz;
+LONGLONG g_buzz_start = 0;
+
+void StartBuzz(const std::vector<BuzzWindow>& pattern) {
+    std::lock_guard<std::mutex> lock(g_buzz_mutex);
+    g_buzz = pattern;
+    g_buzz_start = Qpc();
+}
+
+// Every frame: pulse both hands while inside a window (TriggerHapticPulse, IVRSystem_015 slot 34,
+// is a one-shot of up to ~4 ms, so it's repeated per frame).
+void BuzzTick() {
+    using FnPulse = void(__fastcall*)(void*, vr::TrackedDeviceIndex_t, uint32_t, unsigned short);
+    bool on = false;
+    {
+        std::lock_guard<std::mutex> lock(g_buzz_mutex);
+        if (g_buzz.empty()) return;
+        double ms = (Qpc() - g_buzz_start) * 1000.0 / g_qpf;
+        for (const BuzzWindow& w : g_buzz) on = on || (ms >= w.from_ms && ms < w.to_ms);
+        if (ms >= g_buzz.back().to_ms) g_buzz.clear();
+    }
+    if (!on || !g_system) return;
+    auto pulse = reinterpret_cast<FnPulse>((*reinterpret_cast<void***>(g_system))[34]);
+    for (vr::TrackedDeviceIndex_t i : {g_right, g_left})
+        if (i != vr::k_unTrackedDeviceIndexInvalid) pulse(g_system, i, 0, 3500);
+}
+
 // ---- calibration (mode=calibrate) ----------------------------------------------------------
 // The cursor is pinned at a fixed world direction (where the head pointed when calibration
 // began). The user holds their eyes on it and moves the head slowly, so each new gaze sample is
@@ -452,6 +500,7 @@ Mat3 Calibrate(const Config& c, const Mat3& head, double tilt) {
             WriteIni(L"gain_pitch", "1");
             WriteIni(L"mode", "gaze");
             g_calib.done = true;  // hold the cursor until the ini reload switches to gaze
+            StartBuzz(kBuzzDone);
         } else {
             Log("calibration: not yet: %s; 5 s more", why.c_str());
             g_calib.deadline = now + 5 * g_qpf;
@@ -542,6 +591,7 @@ void ReportEveryFiveSeconds() {
 }
 
 void Tick() {
+    BuzzTick();
     RezState st;
     if (ReadRezState(st)) {
         g_max_game_yaw = std::max(g_max_game_yaw, std::fabs(st.cursor_yaw * 57.29577951308232));
@@ -605,9 +655,56 @@ void __fastcall HookAbs(void* self, vr::ETrackingUniverseOrigin o, float t, vr::
     Rewrite(p, n);
 }
 
+// ---- the calibration combination (both thumbsticks held) -------------------------------------
+
+constexpr uint64_t kStickButton = 1ull << vr::k_EButton_SteamVR_Touchpad;  // Touch thumbstick click
+rezgaze::ComboDetector g_combo(rezgaze::ComboDetector::Both, 2);
+std::mutex g_combo_mutex;
+bool g_stick_left = false, g_stick_right = false;
+Mode g_mode_before_calib = Mode::Gaze;
+
+// The combination fired: start calibration, or cancel a running one.
+void OnCombo() {
+    std::lock_guard<std::mutex> lock(g_cfg_mutex);
+    if (g_cfg.mode != Mode::Calibrate) {
+        g_mode_before_calib = g_cfg.mode;
+        g_cfg.mode = Mode::Calibrate;
+        WriteIni(L"mode", "calibrate");
+        Log("thumbsticks held: calibration starts (hold them again to cancel)");
+        StartBuzz(kBuzzStart);
+    } else {
+        g_cfg.mode = g_mode_before_calib;
+        WriteIni(L"mode", ModeName(g_mode_before_calib));
+        Log("thumbsticks held: calibration cancelled, back to %s", ModeName(g_mode_before_calib));
+        StartBuzz(kBuzzCancel);
+    }
+}
+
 bool __fastcall HookState(void* self, vr::TrackedDeviceIndex_t i, void* s, uint32_t n) {
     ++g_count_state.n;
-    return g_orig_state(self, i, s, n);
+    bool ok = g_orig_state(self, i, s, n);
+    if (!ok || !s || n < sizeof(vr::VRControllerState_t) || (i != g_left && i != g_right)) return ok;
+    auto* state = static_cast<vr::VRControllerState_t*>(s);
+    Config c;
+    {
+        std::lock_guard<std::mutex> lock(g_cfg_mutex);
+        c = g_cfg;
+    }
+    if (c.calib_hold_s <= 0) return ok;
+    bool fired = false, mask = false;
+    {
+        std::lock_guard<std::mutex> lock(g_combo_mutex);
+        bool down = (state->ulButtonPressed & kStickButton) != 0;
+        bool& side = i == g_left ? g_stick_left : g_stick_right;
+        if (down != side) Log("%s thumbstick %s", i == g_left ? "left" : "right", down ? "down" : "up");
+        side = down;
+        g_combo.Set(c.calib_combo_one ? rezgaze::ComboDetector::One : rezgaze::ComboDetector::Both, c.calib_hold_s);
+        fired = g_combo.Update(g_stick_left, g_stick_right, Qpc() / static_cast<double>(g_qpf));
+        mask = g_combo.Masking();
+    }
+    if (fired) OnCombo();
+    if (mask) state->ulButtonPressed &= ~kStickButton;  // the hold that triggered it isn't Rez's
+    return ok;
 }
 
 bool __fastcall HookStatePose(void* self, vr::ETrackingUniverseOrigin o, vr::TrackedDeviceIndex_t i, void* s, uint32_t n, vr::TrackedDevicePose_t* p) {

@@ -28,10 +28,13 @@ back).
 
 Calibrate
 ---------
-In a level, set mode=calibrate in REZ\rez_gaze.ini. The cursor freezes; keep your eyes on it and
-slowly move your head around it (circles, then up/down and left/right) for about 15 s. The fit is
-saved and aiming resumes by itself. Redo it whenever the headset sits differently. Eye tracking
-works best without prescription lens inserts.
+In a level, hold BOTH thumbsticks pressed down for 2 seconds; the controllers buzz once and the
+cursor freezes. Keep your eyes on the cursor and slowly move your head around it (circles, then
+up/down and left/right) for about 15 s. A double buzz means the calibration was saved and eye
+aiming resumes by itself. Holding both thumbsticks again during calibration cancels it (long
+buzz). With one controller, set calib_combo=one in rez_gaze.ini (either thumbstick, 3 s).
+Redo it whenever the headset sits differently. Eye tracking works best without prescription
+lens inserts.
 
 Settings and log
 ----------------

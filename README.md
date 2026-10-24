@@ -77,7 +77,10 @@ Start SteamVR with the Frame first, then Rez. Logs: `REZ\rez_gaze.log` (the DLL)
 Next session, after the 2026-10-22 run (tuned there: `smooth_ms=40`, `yaw=-0.5`,
 `pitch=-0.5`, no prescription lens inserts):
 
-- **Calibrate.** Set `mode=calibrate` while in a level.
+- **Calibrate.** In a level, hold **both thumbsticks down for 2 s**, or set `mode=calibrate`.
+  The combination's settings are `calib_combo=both|one` and `calib_hold_s`. The controllers
+  buzz: short = started, double = saved, long = cancelled (hold again to cancel). The log notes
+  every thumbstick down/up, to confirm that the click arrives as button 32.
   1. The cursor freezes in place in the world.
   2. Keep your eyes on it and slowly move your head around it for 15 s: circles, then up/down
      and left/right, staying under about 30° from it.

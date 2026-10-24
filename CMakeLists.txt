@@ -37,7 +37,7 @@ add_custom_command(TARGET rez_gaze_helper POST_BUILD
 # Unit tests (ctest --test-dir out).
 enable_testing()
 add_executable(rez_gaze_tests tests/test_main.cpp tests/test_gaze_shm.cpp tests/test_aim.cpp proxy/aim.cpp
-    tests/test_gaze_source.cpp proxy/gaze_source.cpp tests/test_filter.cpp proxy/filter.cpp tests/test_calib.cpp proxy/calib.cpp)
+    tests/test_gaze_source.cpp proxy/gaze_source.cpp tests/test_filter.cpp proxy/filter.cpp tests/test_calib.cpp proxy/calib.cpp tests/test_combo.cpp)
 target_compile_definitions(rez_gaze_tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_link_libraries(rez_gaze_tests PRIVATE ws2_32)
 add_test(NAME unit COMMAND rez_gaze_tests)
