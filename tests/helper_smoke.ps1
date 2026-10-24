@@ -29,7 +29,12 @@ if (-not $proc.WaitForExit(1000)) {
     Write-Output "FAIL: helper still running 1 s after its parent exited"
     exit 1
 }
-$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($proc.Id)")
+# Only processes created while the helper lived: once it exits, Windows reuses its PID, and an
+# unrelated process can carry that number as its parent id (a false alarm seen 2026-10-24).
+$born = $proc.StartTime
+$died = $proc.ExitTime
+$children = @(Get-CimInstance Win32_Process -Filter "ParentProcessId = $($proc.Id)" |
+    Where-Object { $_.CreationDate -ge $born -and $_.CreationDate -le $died })
 if ($children.Count -gt 0) {
     Write-Output "FAIL: the helper left child processes: $(($children | ForEach-Object Name) -join ', ')"
     exit 1

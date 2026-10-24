@@ -76,7 +76,7 @@ set_target_properties(fake_openvr_real PROPERTIES OUTPUT_NAME openvr_api_real
     RUNTIME_OUTPUT_DIRECTORY ${HARNESS_DIR} ARCHIVE_OUTPUT_DIRECTORY ${HARNESS_DIR}/lib)
 add_executable(proxy_harness tests/proxy_harness.cpp)
 set_target_properties(proxy_harness PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${HARNESS_DIR})
-target_compile_definitions(proxy_harness PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+target_compile_definitions(proxy_harness PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN REZ_GAZE_VERSION="${REZ_GAZE_VERSION}")
 add_dependencies(proxy_harness fake_openvr_real rez_gaze_proxy rez_gaze_helper)
 # Copy the stand-in and the helper whenever they build, so the harness never runs stale copies.
 add_custom_command(TARGET rez_gaze_proxy POST_BUILD

@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
     {
         std::string first = ReadFile(dir + L"rez_gaze.log");
         first = first.substr(0, first.find('\n'));
-        if (first.find(" loaded") == std::string::npos || first.find("rez_gaze dev") == std::string::npos) {
+        if (first.find(std::string("rez_gaze ") + REZ_GAZE_VERSION + " loaded") == std::string::npos) {
             std::printf("FAIL: stand-in log's first line doesn't name the version: %s\n", first.c_str());
             return 1;
         }

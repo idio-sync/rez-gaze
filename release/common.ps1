@@ -8,7 +8,14 @@ function Fail([string]$message) {
     exit 1
 }
 
-function Sha256([string]$path) { (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToLowerInvariant() }
+# .NET directly, not Get-FileHash: Windows PowerShell started from PowerShell 7 inherits a module
+# path in which Get-FileHash isn't found (seen in CI, 2026-10-24).
+function Sha256([string]$path) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.File]::OpenRead((Resolve-Path -LiteralPath $path).ProviderPath)
+    try { return (($sha.ComputeHash($stream) | ForEach-Object { $_.ToString('x2') }) -join '') }
+    finally { $stream.Dispose(); $sha.Dispose() }
+}
 
 # Rez Infinite's REZ folder, from Steam's library list, or $null.
 function Find-RezDir {
