@@ -14,8 +14,13 @@
 //
 // rez_gaze.ini beside the DLL, reread every second:
 //   [rez_gaze]
-//   mode=log|head|gaze     log: record calls only; head: controllers point where the head
-//                          points; gaze: controllers point where the eyes look
+//   mode=log|head|gaze|calibrate  log: record calls only; head: controllers point where the
+//                          head points; gaze: controllers point where the eyes look;
+//                          calibrate: the cursor is pinned in the world, the user keeps their
+//                          eyes on it and moves the head; after calib_seconds the fit is saved
+//                          as calib= and the mode returns to gaze (trims reset)
+//   calib=m00,...,m12      angle-space correction from mode=calibrate (written by it)
+//   calib_seconds=15       how long calibration collects before fitting
 //   hand=right|left|both   which controller(s) to rewrite
 //   tilt=auto              degrees about the controller's X added to undo the game's offset;
 //                          auto = 39.4 when the tracking system is "oculus", else 0
@@ -39,6 +44,7 @@
 #include <openvr.h>
 
 #include "aim.h"
+#include "calib.h"
 #include "filter.h"
 #include "gaze_source.h"
 
@@ -74,7 +80,7 @@ void Log(const char* fmt, ...) {
     std::fflush(g_log);
 }
 
-enum class Mode { Log, Head, Gaze };
+enum class Mode { Log, Head, Gaze, Calibrate };
 
 struct Config {
     Mode mode = Mode::Log;
@@ -83,6 +89,8 @@ struct Config {
     double tilt = 0, pitch = 0, yaw = 0, smooth_ms = 0;
     double gain_yaw = 1, gain_pitch = 1;
     bool filter_euro = false;
+    rezgaze::Affine2 calib;  // identity unless rez_gaze.ini has calib=
+    double calib_seconds = 15;
     double euro_min_cutoff = 1.0, euro_beta = 0.05;
     bool helper = true;
     double helper_delay_s = 10;
@@ -98,7 +106,10 @@ Config ReadConfig() {
     wchar_t buf[64];
     Config c;
     GetPrivateProfileStringW(L"rez_gaze", L"mode", L"log", buf, 64, ini.c_str());
-    c.mode = _wcsicmp(buf, L"head") == 0 ? Mode::Head : _wcsicmp(buf, L"gaze") == 0 ? Mode::Gaze : Mode::Log;
+    c.mode = _wcsicmp(buf, L"head") == 0        ? Mode::Head
+             : _wcsicmp(buf, L"gaze") == 0      ? Mode::Gaze
+             : _wcsicmp(buf, L"calibrate") == 0 ? Mode::Calibrate
+                                                : Mode::Log;
     GetPrivateProfileStringW(L"rez_gaze", L"hand", L"both", buf, 64, ini.c_str());
     c.right = _wcsicmp(buf, L"left") != 0;
     c.left = _wcsicmp(buf, L"right") != 0;
@@ -116,6 +127,14 @@ Config ReadConfig() {
     c.gain_yaw = num(L"gain_yaw", 1);
     GetPrivateProfileStringW(L"rez_gaze", L"filter", L"ema", buf, 64, ini.c_str());
     c.filter_euro = _wcsicmp(buf, L"euro") == 0;
+    {
+        wchar_t cal[256];
+        GetPrivateProfileStringW(L"rez_gaze", L"calib", L"", cal, 256, ini.c_str());
+        std::string text;
+        for (const wchar_t* p = cal; *p; ++p) text += static_cast<char>(*p);  // digits, commas, signs
+        rezgaze::ParseCalibration(text, c.calib);  // stays identity if absent or malformed
+    }
+    c.calib_seconds = num(L"calib_seconds", 15);
     c.euro_min_cutoff = num(L"euro_min_cutoff", 1.0);
     c.euro_beta = num(L"euro_beta", 0.05);
     c.gain_pitch = num(L"gain_pitch", 1);
@@ -129,7 +148,9 @@ Config ReadConfig() {
     return c;
 }
 
-const char* ModeName(Mode m) { return m == Mode::Head ? "head" : m == Mode::Gaze ? "gaze" : "log"; }
+const char* ModeName(Mode m) {
+    return m == Mode::Head ? "head" : m == Mode::Gaze ? "gaze" : m == Mode::Calibrate ? "calibrate" : "log";
+}
 
 // ---- gaze sources -------------------------------------------------------------------------
 
@@ -310,6 +331,7 @@ V3 HeadGaze(const Config& c) {
     }
     if (src == rezgaze::Source::Helper) g = helper_dir;
     else if (src == rezgaze::Source::Osc) g = osc_dir;
+    if (src != rezgaze::Source::Head) g = rezgaze::ApplyCalibration(c.calib, g);
     LONGLONG now = Qpc();
     if (c.filter_euro && src != rezgaze::Source::Head) {
         // Filter each sample once, at its own time: this runs every frame, faster than samples
@@ -334,6 +356,110 @@ std::atomic<long> g_rewrites{0};
 // gaze itself is compressed.
 double g_max_want_yaw = 0, g_max_want_pitch = 0, g_max_game_yaw = 0, g_max_game_pitch = 0;
 
+// ---- calibration (mode=calibrate) ----------------------------------------------------------
+// The cursor is pinned at a fixed world direction (where the head pointed when calibration
+// began). The user holds their eyes on it and moves the head slowly, so each new gaze sample is
+// a pair: what the tracker reports, and where the eyes must point (the pinned direction in head
+// space). After calib_seconds the pairs are fitted (calib.cpp) and written to rez_gaze.ini as
+// calib=..., with mode=gaze and the hand trims (yaw, pitch, gain_*) reset, since the fit replaces
+// them.
+
+struct CalibrationRun {
+    bool active = false, done = false;
+    V3 target_world{0, 0, -1};
+    LONGLONG start = 0, deadline = 0, last_sample = 0, last_report = 0, last_head_qpc = 0;
+    V3 last_head_fwd{0, 0, -1};
+    rezgaze::CalibrationFit fit;
+};
+CalibrationRun g_calib;
+
+// The raw gaze (no calibration, no filter) from the source ChooseSource picks, and its time.
+bool RawGaze(const Config& c, V3& g, LONGLONG& sample) {
+    V3 hd, od;
+    double ha = -1, oa = -1;
+    bool tracked = false;
+    std::string status;
+    if (!g_helper.Read(hd, ha, tracked, status)) ha = -1;
+    if (!g_osc.Read(od, oa)) oa = -1;
+    switch (rezgaze::ChooseSource(c.source, ha, tracked, oa)) {
+        case rezgaze::Source::Helper: g = hd, sample = g_helper.SampleQpc(); return true;
+        case rezgaze::Source::Osc: g = od, sample = g_osc.SampleQpc(); return true;
+        default: return false;
+    }
+}
+
+void WriteIni(const wchar_t* key, const std::string& value) {
+    std::wstring v(value.begin(), value.end());
+    WritePrivateProfileStringW(L"rez_gaze", key, v.c_str(), (g_dir + L"rez_gaze.ini").c_str());
+}
+
+// This frame's controller rotation during calibration: the cursor pinned in the world.
+Mat3 Calibrate(const Config& c, const Mat3& head, double tilt) {
+    constexpr double kToDeg = 57.29577951308232;
+    LONGLONG now = Qpc();
+    V3 fwd = Norm(head.col[2] * -1);
+    if (!g_calib.active) {
+        g_calib = CalibrationRun{};
+        g_calib.active = true;
+        g_calib.target_world = fwd;
+        g_calib.start = g_calib.last_report = now;
+        g_calib.deadline = now + static_cast<LONGLONG>(c.calib_seconds * g_qpf);
+        Log("calibration: keep your eyes on the cursor and slowly move your head around it (circles, then "
+            "up/down and left/right) for %.0f s",
+            c.calib_seconds);
+    }
+    V3 t{Dot(head.col[0], g_calib.target_world), Dot(head.col[1], g_calib.target_world),
+         Dot(head.col[2], g_calib.target_world)};
+    double ty = std::atan2(t.x, -t.z) * kToDeg, tp = std::atan2(t.y, -t.z) * kToDeg;
+
+    // Skip samples while the head turns fast: the cursor is drawn at the 60 Hz tick and lags it.
+    double speed = 0;
+    if (g_calib.last_head_qpc && now > g_calib.last_head_qpc) {
+        double dot = std::max(-1.0, std::min(1.0, Dot(fwd, g_calib.last_head_fwd)));
+        speed = std::acos(dot) * kToDeg / ((now - g_calib.last_head_qpc) / static_cast<double>(g_qpf));
+    }
+    g_calib.last_head_fwd = fwd;
+    g_calib.last_head_qpc = now;
+
+    V3 g;
+    LONGLONG sample = 0;
+    if (!g_calib.done && now - g_calib.start > g_qpf && t.z < 0 && std::hypot(ty, tp) < 35 && speed < 40 &&
+        RawGaze(c, g, sample) && sample != g_calib.last_sample && g.z < 0) {
+        g_calib.last_sample = sample;
+        g_calib.fit.Add(std::atan2(g.x, -g.z) * kToDeg, std::atan2(g.y, -g.z) * kToDeg, ty, tp);
+    }
+    if (!g_calib.done && now - g_calib.last_report >= g_qpf) {
+        double yr, pr;
+        g_calib.fit.Coverage(yr, pr);
+        Log("calibration: %zu samples, eyes covered %.0f deg across, %.0f deg up/down, %.0f s left",
+            g_calib.fit.Count(), yr, pr, std::max(0.0, (g_calib.deadline - now) / static_cast<double>(g_qpf)));
+        g_calib.last_report = now;
+    }
+    if (!g_calib.done && now >= g_calib.deadline) {
+        rezgaze::Affine2 a;
+        double rms;
+        std::string why;
+        if (g_calib.fit.Solve(a, rms, why)) {
+            Log("calibration done: %zu samples, %.2f deg rms left; true yaw = %.3f*yaw %+.3f*pitch %+.2f, "
+                "true pitch = %+.3f*yaw %.3f*pitch %+.2f",
+                g_calib.fit.Count(), rms, a.m[0][0], a.m[0][1], a.m[0][2], a.m[1][0], a.m[1][1], a.m[1][2]);
+            Log("calibration replaces the hand trims: yaw %.1f, pitch %.1f, gain %.2f/%.2f all reset", c.yaw, c.pitch,
+                c.gain_yaw, c.gain_pitch);
+            WriteIni(L"calib", rezgaze::FormatCalibration(a));
+            WriteIni(L"yaw", "0");
+            WriteIni(L"pitch", "0");
+            WriteIni(L"gain_yaw", "1");
+            WriteIni(L"gain_pitch", "1");
+            WriteIni(L"mode", "gaze");
+            g_calib.done = true;  // hold the cursor until the ini reload switches to gaze
+        } else {
+            Log("calibration: not yet: %s; 5 s more", why.c_str());
+            g_calib.deadline = now + 5 * g_qpf;
+        }
+    }
+    return rezgaze::AimRotation(head, t, tilt, 0, 0);
+}
+
 void Rewrite(vr::TrackedDevicePose_t* poses, uint32_t n) {
     if (!poses || n == 0) return;
     Config c;
@@ -341,16 +467,23 @@ void Rewrite(vr::TrackedDevicePose_t* poses, uint32_t n) {
         std::lock_guard<std::mutex> lock(g_cfg_mutex);
         c = g_cfg;
     }
+    if (c.mode != Mode::Calibrate) g_calib.active = g_calib.done = false;
     if (c.mode == Mode::Log || !poses[0].bPoseIsValid) return;
-    // The game projects the controller ray 400 m out, so the hand's offset from the head
-    // doesn't matter: only the rotation is rewritten.
-    V3 gaze = c.mode == Mode::Gaze ? rezgaze::ScaleGaze(HeadGaze(c), c.gain_yaw, c.gain_pitch) : V3{0, 0, -1};
-    double want_yaw = std::atan2(gaze.x, -gaze.z) * 57.29577951308232 + c.yaw;
-    double want_pitch = std::atan2(gaze.y, -gaze.z) * 57.29577951308232 + c.pitch;
-    if (std::fabs(want_yaw) > g_max_want_yaw) g_max_want_yaw = std::fabs(want_yaw);
-    if (std::fabs(want_pitch) > g_max_want_pitch) g_max_want_pitch = std::fabs(want_pitch);
     double tilt = c.tilt_auto ? (g_is_oculus ? 39.4 : 0.0) : c.tilt;
-    Mat3 aim = rezgaze::AimRotation(Rotation(poses[0].mDeviceToAbsoluteTracking), gaze, tilt, c.yaw, c.pitch);
+    Mat3 head = Rotation(poses[0].mDeviceToAbsoluteTracking);
+    Mat3 aim;
+    if (c.mode == Mode::Calibrate) {
+        aim = Calibrate(c, head, tilt);
+    } else {
+        // The game projects the controller ray 400 m out, so the hand's offset from the head
+        // doesn't matter: only the rotation is rewritten.
+        V3 gaze = c.mode == Mode::Gaze ? rezgaze::ScaleGaze(HeadGaze(c), c.gain_yaw, c.gain_pitch) : V3{0, 0, -1};
+        double want_yaw = std::atan2(gaze.x, -gaze.z) * 57.29577951308232 + c.yaw;
+        double want_pitch = std::atan2(gaze.y, -gaze.z) * 57.29577951308232 + c.pitch;
+        if (std::fabs(want_yaw) > g_max_want_yaw) g_max_want_yaw = std::fabs(want_yaw);
+        if (std::fabs(want_pitch) > g_max_want_pitch) g_max_want_pitch = std::fabs(want_pitch);
+        aim = rezgaze::AimRotation(head, gaze, tilt, c.yaw, c.pitch);
+    }
     for (vr::TrackedDeviceIndex_t i : {c.right ? g_right : vr::k_unTrackedDeviceIndexInvalid,
                                        c.left ? g_left : vr::k_unTrackedDeviceIndexInvalid}) {
         if (i == vr::k_unTrackedDeviceIndexInvalid || i >= n || !poses[i].bPoseIsValid) continue;

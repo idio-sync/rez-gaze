@@ -62,6 +62,16 @@ Start SteamVR with the Frame first, then Rez. Logs: `REZ\rez_gaze.log` (the DLL)
 Next session, after the 2026-10-22 run (tuned there: `smooth_ms=40`, `yaw=-0.5`,
 `pitch=-0.5`, no prescription lens inserts):
 
+- **Calibrate.** Set `mode=calibrate` while in a level.
+  1. The cursor freezes in place in the world.
+  2. Keep your eyes on it and slowly move your head around it for 15 s: circles, then up/down
+     and left/right, staying under about 30° from it.
+  3. The log counts the samples and how far your eyes swept. When enough is collected, it
+     writes `calib=…` into the ini, resets `yaw`/`pitch`/`gain_*`, and switches back to
+     `mode=gaze` on its own.
+
+  It refuses a fit (and keeps collecting) if your head didn't move enough. Redo it whenever
+  the headset sits differently.
 - **Helper with the delayed start.** Rename `REZ\rez_gaze_off\` back to `rez_gaze\`, keep
   `helper_delay_s=10`, then launch. If Rez goes black when the helper starts (about 10 s in),
   set `helper=0` and tell me. If it stays fine, try `source=helper` against `source=osc`.
