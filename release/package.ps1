@@ -3,7 +3,7 @@
 #   powershell -ExecutionPolicy Bypass -File release\package.ps1 -Out out -Version dev [-Dest dist]
 #
 # The zip holds one folder, rez-gaze-<version>\, laid out like Rez's REZ folder plus the
-# install scripts. CI runs this for the rolling nightly (.github/workflows/nightly.yml).
+# install scripts. CI runs this for the nightly and tagged releases (.github/workflows/release.yml).
 param(
     [Parameter(Mandatory = $true)][string]$Out,
     [Parameter(Mandatory = $true)][string]$Version,

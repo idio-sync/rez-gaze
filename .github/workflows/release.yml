@@ -1,0 +1,106 @@
+# Builds, tests and packages rez-gaze on a Windows runner, then publishes:
+# - every push to main: replaces the single rolling "nightly" pre-release (releases/tag/nightly);
+# - every pushed tag v*: a release named after the tag (a pre-release if the tag has a "-", e.g.
+#   v0.2.0-beta), with notes listing the commits since the previous v* tag. Tagged releases are
+#   never replaced or deleted.
+# A failing build or test publishes nothing.
+name: release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  # A newer push to main supersedes a nightly in progress; tag builds always finish.
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+jobs:
+  release:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # all commits and tags, for the release notes
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Version
+        shell: pwsh
+        run: |
+          $short = $env:GITHUB_SHA.Substring(0, 7)
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "nightly-$short" }
+          "VERSION=$version" >> $env:GITHUB_ENV
+          "SHORT_SHA=$short" >> $env:GITHUB_ENV
+
+      - name: Configure
+        shell: pwsh
+        run: cmake -S . -B out -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release "-DREZ_GAZE_VERSION=$env:VERSION"
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build out
+
+      - name: Test
+        shell: pwsh
+        run: ctest --test-dir out --output-on-failure
+
+      - name: Package
+        shell: pwsh
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File release/package.ps1 -Out out -Version $env:VERSION -Dest dist
+
+      - name: Publish nightly
+        if: github.ref == 'refs/heads/main'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $subject = git log -1 --format=%s
+          $notes = @"
+          Rolling nightly build of main at $env:SHORT_SHA: $subject
+
+          Built and tested by CI; replaced on every push. Experimental.
+          Install: unzip, close Rez, run install.ps1 (see README.txt inside).
+          "@
+          gh release delete nightly --yes --cleanup-tag 2>$null
+          $global:LASTEXITCODE = 0
+          gh release create nightly "dist/rez-gaze-$env:VERSION.zip" --prerelease --target $env:GITHUB_SHA `
+            --title "Nightly $env:SHORT_SHA" --notes $notes
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          # The previous v* tag that this one builds on (the rolling "nightly" tag doesn't count).
+          $older = @(git tag --list 'v*' --sort=-v:refname | Where-Object { $_ -ne $tag })
+          $prev = $null
+          foreach ($t in $older) {
+            git merge-base --is-ancestor $t $tag 2>$null
+            if ($LASTEXITCODE -eq 0) { $prev = $t; break }
+          }
+          $global:LASTEXITCODE = 0
+          $range = if ($prev) { "$prev..$tag" } else { $tag }
+          $changes = git log $range --no-merges --format='- %s (%h)'
+          $since = if ($prev) { "Changes since $prev" } else { 'Changes' }
+          $body = @(
+            "rez-gaze $tag`: eye-gaze aiming for Rez Infinite on the Steam Frame (PC VR)."
+            ''
+            'Install: unzip, close Rez, run install.ps1 (README.txt inside explains the rest).'
+            ''
+            "## $since"
+            $changes
+          ) -join "`n"
+          Set-Content -Path notes.md -Value $body -Encoding utf8
+          $flags = @('--verify-tag', '--title', "rez-gaze $tag", '--notes-file', 'notes.md')
+          if ($tag.Contains('-')) { $flags += '--prerelease' }
+          gh release create $tag "dist/rez-gaze-$tag.zip" @flags
